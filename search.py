@@ -8,20 +8,19 @@ import gradio as gr
 import csv
 import io
 import re
+from collections import Counter
 from datetime import datetime
 
 PAGE_SIZE = 20
 
-# 定义物理相关期刊列表
 PHYSICS_JOURNALS = [
-    "Physical Review", "Journal of Chemical Physics", "Journal of Quantitative Spectroscopy and Radiative Transfer",
+    "Physical Review", "Journal of Chemical Physics","Journal of Molecular Structure", "Journal of Quantitative Spectroscopy and Radiative Transfer",
     "Journal of Molecular Spectroscopy", "Astrophysical Journal", "Astronomy & Astrophysics", "Molecular Physics",
     "Chemical Physics Letters", "Journal of Physical Chemistry", "Journal of Geophysical Research", "Icarus",
     "Planetary and Space Science", "Optics Express", "Applied Optics", "Spectrochimica Acta Part A",
     "Journal of the Optical Society of America", "Journal of Molecular Structure", "Chemical Physics",
     "Atmospheric Chemistry and Physics", "Journal of Atmospheric Sciences", "Physics Letters A",
-    "Journal of Chemical Physics", "Physical Chemistry Chemical Physics", "Journal of Physical Chemistry A",
-    "Journal of Physical Chemistry B", "Review of Scientific Instruments", "Journal of Applied Physics",
+    "Physical Chemistry Chemical Physics", "Review of Scientific Instruments", "Journal of Applied Physics",
     "Journal of Physics B", "Journal of Physics D", "Journal of Physics: Condensed Matter", "Physics of Fluids",
     "Physics of Plasmas", "Physics Today", "Nature Physics", "Science", "Physics Reports", "Physics Letters B",
     "Nuclear Physics", "Physical Review Letters", "Physical Review A", "Physical Review B", "Physical Review C",
@@ -37,45 +36,38 @@ PARAM_KEYWORDS = [
     "J =", "K =", "data", "coefficient", "result", "parameter"
 ]
 
-# 新增：期刊过滤函数
 def is_physics_journal(journal_name):
-    """检查期刊是否属于物理相关期刊"""
     if not journal_name:
         return False
     journal_lower = journal_name.lower()
     return any(physics_journal.lower() in journal_lower for physics_journal in PHYSICS_JOURNALS)
 
-# 化学式边界检测函数
 def is_chemical_formula(text):
-    """检测文本是否是化学式（大写字母开头，包含数字或特殊符号）"""
     return re.match(r'^[A-Z][A-Z0-9_]*$', text) is not None
 
 def highlight_keywords(text, keywords):
     if not text: return ""
     all_kws = list(set([k.lower() for k in keywords] + [k.lower() for k in PARAM_KEYWORDS]))
-    
-    # 区分化学式和普通关键词的标记方式
+
     def chemical_replacer(match):
         word = match.group(0)
         return f'<mark style="background:#ff9999;border-radius:3px;padding:1px 3px">{word}</mark>'
-    
+
     def normal_replacer(match):
         word = match.group(0)
         return f'<mark style="background:#ffe066;border-radius:3px;padding:1px 3px">{word}</mark>'
-    
-    # 先处理化学式（大写）
+
     chemical_formulas = [kw for kw in all_kws if is_chemical_formula(kw)]
     for cf in chemical_formulas:
         pattern = r'\b' + re.escape(cf) + r'\b'
         text = re.sub(pattern, chemical_replacer, text)
-    
-    # 处理普通关键词
+
     normal_keywords = [kw for kw in all_kws if not is_chemical_formula(kw)]
     for kw in normal_keywords:
         if kw.strip():
             pattern = r'\b' + re.escape(kw) + r'\b'
             text = re.sub(pattern, normal_replacer, text, flags=re.IGNORECASE)
-    
+
     return text
 
 def has_param_info(entry, param_keywords=PARAM_KEYWORDS):
@@ -85,15 +77,12 @@ def has_param_info(entry, param_keywords=PARAM_KEYWORDS):
 def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=None, max_year=None, journal_filter=False):
     bib_database = bibtexparser.loads(bibstr)
     matches = []
-    
-    # 预处理物种：将化学式转为大写
     species = [s.upper() if is_chemical_formula(s) else s for s in species]
-    
     for entry in bib_database.entries:
         content = " ".join(str(entry.get(k, "")).lower() for k in ['title','abstract','keywords','note'])
         content_original = " ".join(str(entry.get(k, "")) for k in ['title','abstract','keywords','note'])
-        
-        # 关键词匹配（使用边界检测）
+
+        # 关键词匹配
         if keywords:
             kw_found = False
             for kw in keywords:
@@ -103,18 +92,15 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
                     break
             if not kw_found:
                 continue
-        
-        # 物种匹配（化学式区分大小写）
+        # 物种匹配
         if species:
             species_found = False
             for s in species:
-                # 化学式使用原始大小写匹配
                 if is_chemical_formula(s):
                     pattern = r'\b' + re.escape(s) + r'\b'
                     if re.search(pattern, content_original):
                         species_found = True
                         break
-                # 普通物种名称使用小写匹配
                 else:
                     pattern = r'\b' + re.escape(s.lower()) + r'\b'
                     if re.search(pattern, content):
@@ -122,8 +108,7 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
                         break
             if not species_found:
                 continue
-        
-        # 缓冲气匹配（使用边界检测）
+        # 缓冲气匹配
         if perturber:
             perturber_found = False
             for p in perturber:
@@ -133,7 +118,6 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
                     break
             if not perturber_found:
                 continue
-        
         year = entry.get('year','')
         try:
             year_val = int(year)
@@ -143,15 +127,11 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
             continue
         if max_year and year_val and year_val > max_year:
             continue
-        
-        # 期刊过滤
         journal = entry.get('journal','') or entry.get('booktitle','')
         if journal_filter and journal and not is_physics_journal(journal):
             continue
-            
         if not has_param_info(entry):
             continue
-            
         matches.append({
             "Title": entry.get('title',''),
             "Authors": entry.get('author',''),
@@ -168,11 +148,10 @@ def has_param_info_crossref(item, param_keywords=PARAM_KEYWORDS):
     text = (title + " " + abstract).lower()
     return any(re.search(r'\b' + re.escape(pk.lower()) + r'\b', text) for pk in param_keywords)
 
-def search_crossref(query, max_results=1000, min_year=None, max_year=None, journal_filter=False):
+def search_crossref(query, max_results=1000, min_year=None, max_year=None, journal_filter=False, journal_priority_list=None):
     papers = []
     batch = 1000
     offset = 0
-    
     while len(papers) < max_results:
         rows = min(batch, max_results - len(papers))
         try:
@@ -191,12 +170,8 @@ def search_crossref(query, max_results=1000, min_year=None, max_year=None, journ
             for item in items:
                 if not has_param_info_crossref(item):
                     continue
-                
                 title = (item.get("title") or [""])[0] or ""
                 abstract = item.get("abstract", "") or ""
-                content = (title + " " + abstract).lower()
-                content_original = title + " " + abstract
-                
                 authors = ", ".join(f"{p.get('given','')} {p.get('family','')}".strip() for p in item.get("author", []))
                 pub = item.get("published-print", item.get("published-online", {}))
                 year = pub.get("date-parts", [[None]])[0][0]
@@ -208,12 +183,9 @@ def search_crossref(query, max_results=1000, min_year=None, max_year=None, journ
                     continue
                 if max_year and year_val and year_val > max_year:
                     continue
-                
-                # 期刊过滤
                 journal = (item.get("container-title") or [""])[0]
                 if journal_filter and journal and not is_physics_journal(journal):
                     continue
-                
                 papers.append({
                     "Title": title,
                     "Authors": authors,
@@ -228,16 +200,18 @@ def search_crossref(query, max_results=1000, min_year=None, max_year=None, journ
         except Exception as e:
             print("CrossRef error:", e)
             break
+    # 结果按高频期刊优先级排序
+    if journal_priority_list:
+        papers = sort_by_journal_priority(papers, journal_priority_list)
     return papers
 
-# 彻底去重：DOI优先，无DOI则用标题+作者简拼哈希
 def get_key(entry):
     doi = (entry.get('DOI', '') or '').strip().lower()
     if doi:
         return "doi:" + doi
     title = (entry.get('Title', '') or '').strip().lower()
     authors = (entry.get('Authors', '') or '').strip().lower()
-    short = "".join(authors.split()[:2])  # 取作者前两个词
+    short = "".join(authors.split()[:2])
     return "title:" + title + "|auth:" + short
 
 def deduplicate_papers(papers):
@@ -272,6 +246,37 @@ def bibfile_to_str(bibfile):
     except Exception as e:
         print("读取 bib 文件失败:", e)
         return None
+
+def extract_keywords_and_journal_priority(bibstr, topn_keywords=15):
+    bib_database = bibtexparser.loads(bibstr)
+    title_words = []
+    journals = []
+    stopwords = set([
+        "the", "of", "in", "for", "and", "to", "on", "a", "with", "as", "by", "at",
+        "an", "from", "study", "line", "lines", "broadening", "parameters", "rotational",
+        "pressure", "dependence", "determination", "measurement", "coefficients",
+        "spectroscopy", "molecular", "collision", "quantum"
+    ])
+    for entry in bib_database.entries:
+        title = entry.get('title', '')
+        words = re.findall(r'\b[a-zA-Z0-9]{3,}\b', title.lower())
+        words = [w for w in words if w not in stopwords]
+        title_words.extend(words)
+        journal = entry.get('journal', '') or entry.get('booktitle', '')
+        if journal:
+            journals.append(journal.strip())
+    keyword_freq = Counter(title_words)
+    journal_freq = Counter(journals)
+    top_keywords = [w for w, _ in keyword_freq.most_common(topn_keywords)]
+    journal_priority = [j for j, _ in journal_freq.most_common()]
+    return top_keywords, journal_priority
+
+def sort_by_journal_priority(results, journal_priority_list):
+    journal2rank = {j.lower(): i for i, j in enumerate(journal_priority_list)}
+    def get_rank(r):
+        j = r.get("Journal", "").lower()
+        return journal2rank.get(j, len(journal_priority_list))
+    return sorted(results, key=get_rank)
 
 def format_results_html(results, page=1, keywords=[]):
     total = len(results)
@@ -324,31 +329,29 @@ def export_results_csv(results):
         writer.writerow(r)
     return csv_buffer.getvalue().encode("utf-8")
 
-# 默认年份为近10年
 CUR_YEAR = datetime.now().year
 DEFAULT_MIN_YEAR = CUR_YEAR - 9
 DEFAULT_MAX_YEAR = CUR_YEAR
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown(f"""
-    <h2 style='color:#385b95;font-weight:700'>分子压力展宽参数文献筛查（物理期刊限定）</h2>
+    <h2 style='color:#385b95;font-weight:700'>分子压力展宽参数文献筛查（自动高频关键词与期刊排序）</h2>
     <div style='color:#777;font-size:15px;margin-bottom:10px'>
-    默认只查最新10年。可用多关键词、多分子、多缓冲气及年份过滤，结果自动去重、分页美观展示，参数关键词智能高亮。导出CSV便于批量处理。DOI可点开也可点击复制。<br>
+    默认只查最新10年。上传bib文件后自动推荐关键词、并按高频期刊排序。分页美观展示，参数关键词智能高亮。导出CSV便于批量处理。DOI可点开也可点击复制。<br>
     <b style='color:#e85c00'>只显示包含实验/参数数据的文献，重复文献自动去除。</b>
     <div style='margin-top:8px;color:#d35400'>
-    <b>注意：Active Species (如NO, CO2) 会自动识别为化学式，匹配时将区分大小写并作为独立实体处理</b>
+    <b>Active Species (如NO, CO2) 会自动识别为化学式，匹配时将区分大小写并作为独立实体处理</b>
     </div>
     <div style='margin-top:8px;background:#e6f7ff;padding:8px;border-radius:4px'>
-    <b>期刊限定：</b> 结果仅包含物理相关期刊（{len(PHYSICS_JOURNALS)}种），如Physical Review, J. Chem. Phys., JQSRT等
+    <b>结果优先显示本库高频期刊论文，物理期刊用蓝色背景突出</b>
     </div>
     </div>
     """)
-    with gr.Row():
-        bib_input = gr.File(label="上传本地 BibTeX 文件（可选）", file_types=[".bib"])
-    with gr.Row():
-        keywords_input = gr.Textbox(label="检索关键词 (逗号分隔)", value="broadening, measurement, gamma, uncertainty", scale=3)
-        species_input = gr.Textbox(label="Active Species/分子 (逗号分隔)", value="NO", scale=2)
-        perturber_input = gr.Textbox(label="Perturbers/缓冲气 (逗号分隔)", value="N2", scale=2)
+
+    bib_input = gr.File(label="上传本地 BibTeX 文件（推荐）", file_types=[".bib"])
+    keywords_input = gr.Textbox(label="检索关键词 (逗号分隔)", value="", scale=3)
+    species_input = gr.Textbox(label="Active Species/分子 (逗号分隔)", value="NO", scale=2)
+    perturber_input = gr.Textbox(label="Perturbers/缓冲气 (逗号分隔)", value="N2", scale=2)
     with gr.Row():
         min_year_input = gr.Number(label="最早年份 (可选)", value=DEFAULT_MIN_YEAR, precision=0, scale=1)
         max_year_input = gr.Number(label="最晚年份 (可选)", value=DEFAULT_MAX_YEAR, precision=0, scale=1)
