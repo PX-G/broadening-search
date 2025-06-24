@@ -14,11 +14,11 @@ from datetime import datetime
 PAGE_SIZE = 20
 
 PHYSICS_JOURNALS = [
-    "Physical Review", "Journal of Chemical Physics","Journal of Molecular Structure", "Journal of Quantitative Spectroscopy and Radiative Transfer",
+    "Physical Review", "Journal of Chemical Physics", "Journal of Molecular Structure", "Journal of Quantitative Spectroscopy and Radiative Transfer",
     "Journal of Molecular Spectroscopy", "Astrophysical Journal", "Astronomy & Astrophysics", "Molecular Physics",
     "Chemical Physics Letters", "Journal of Physical Chemistry", "Journal of Geophysical Research", "Icarus",
     "Planetary and Space Science", "Optics Express", "Applied Optics", "Spectrochimica Acta Part A",
-    "Journal of the Optical Society of America", "Journal of Molecular Structure", "Chemical Physics",
+    "Journal of the Optical Society of America", "Chemical Physics",
     "Atmospheric Chemistry and Physics", "Journal of Atmospheric Sciences", "Physics Letters A",
     "Physical Chemistry Chemical Physics", "Review of Scientific Instruments", "Journal of Applied Physics",
     "Journal of Physics B", "Journal of Physics D", "Journal of Physics: Condensed Matter", "Physics of Fluids",
@@ -33,7 +33,10 @@ PARAM_KEYWORDS = [
     "gamma", "γ", "pressure broadening coefficient", "temperature exponent", "n=", "γ=",
     "measured", "measurement", "experimental", "value", "fit", "uncertainty",
     "cm-1 atm-1", "reported", "determined", "parameters", "obtained", "tabulated", "table",
-    "J =", "K =", "data", "coefficient", "result", "parameter"
+    "J =", "K =", "data", "coefficient", "result", "parameter", "shift", "pressure", "rotational",
+    "collision", "dependence", "determination", "half-width", "linewidth", "spectra", "temperature", 
+    "comparison", "collisional", "intensity", "narrowing", "vibration", "overtone", "band", "transition", 
+    "calculation","absorption", "theory", "data"
 ]
 
 def is_physics_journal(journal_name):
@@ -82,7 +85,7 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
         content = " ".join(str(entry.get(k, "")).lower() for k in ['title','abstract','keywords','note'])
         content_original = " ".join(str(entry.get(k, "")) for k in ['title','abstract','keywords','note'])
 
-        # 关键词匹配
+        # Keyword match
         if keywords:
             kw_found = False
             for kw in keywords:
@@ -92,7 +95,7 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
                     break
             if not kw_found:
                 continue
-        # 物种匹配
+        # Species match
         if species:
             species_found = False
             for s in species:
@@ -108,7 +111,7 @@ def bib_match_entries(bibstr, keywords=[], species=[], perturber=[], min_year=No
                         break
             if not species_found:
                 continue
-        # 缓冲气匹配
+        # Perturber match
         if perturber:
             perturber_found = False
             for p in perturber:
@@ -200,7 +203,7 @@ def search_crossref(query, max_results=1000, min_year=None, max_year=None, journ
         except Exception as e:
             print("CrossRef error:", e)
             break
-    # 结果按高频期刊优先级排序
+    # Sort results by journal priority if provided
     if journal_priority_list:
         papers = sort_by_journal_priority(papers, journal_priority_list)
     return papers
@@ -244,7 +247,7 @@ def bibfile_to_str(bibfile):
         else:
             return None
     except Exception as e:
-        print("读取 bib 文件失败:", e)
+        print("Failed to read bib file:", e)
         return None
 
 def extract_keywords_and_journal_priority(bibstr, topn_keywords=15):
@@ -316,8 +319,8 @@ def format_results_html(results, page=1, keywords=[]):
         html += f'<td style="text-align:center;">{r["Source"]}</td>'
         html += '</tr>'
     html += '</tbody></table>'
-    html += f'<div style="padding:6px;text-align:right;color:#666">共 <b>{total}</b> 条，当前第 <b>{page}</b> 页 / 共 <b>{(total-1)//PAGE_SIZE+1}</b> 页</div>'
-    html += f'<div style="padding:6px;background:#e6f7ff;border-radius:4px;margin-top:8px">蓝色背景：物理相关期刊</div>'
+    html += f'<div style="padding:6px;text-align:right;color:#666">Total <b>{total}</b> entries, page <b>{page}</b> / <b>{(total-1)//PAGE_SIZE+1}</b></div>'
+    html += f'<div style="padding:6px;background:#e6f7ff;border-radius:4px;margin-top:8px">Blue background: Physics journal</div>'
     html += '</div>'
     return html
 
@@ -335,33 +338,33 @@ DEFAULT_MAX_YEAR = CUR_YEAR
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown(f"""
-    <h2 style='color:#385b95;font-weight:700'>分子压力展宽参数文献筛查（自动高频关键词与期刊排序）</h2>
+    <h2 style='color:#385b95;font-weight:700'>Molecular Pressure Broadening Parameters Literature Screening (auto-high-frequency keywords & journal ranking)</h2>
     <div style='color:#777;font-size:15px;margin-bottom:10px'>
-    默认只查最新10年。上传bib文件后自动推荐关键词、并按高频期刊排序。分页美观展示，参数关键词智能高亮。导出CSV便于批量处理。DOI可点开也可点击复制。<br>
-    <b style='color:#e85c00'>只显示包含实验/参数数据的文献，重复文献自动去除。</b>
+    By default, only the latest 10 years are searched. After uploading a bib file, recommended keywords and journal frequency are auto-extracted for sorting. Pagination, smart keyword highlighting. Export CSV for batch processing. Click DOI to copy.<br>
+    <b style='color:#e85c00'>Only papers with experimental/parameter data are shown. Duplicates removed.</b>
     <div style='margin-top:8px;color:#d35400'>
-    <b>Active Species (如NO, CO2) 会自动识别为化学式，匹配时将区分大小写并作为独立实体处理</b>
+    <b>Active Species (e.g., NO, CO2) will be treated as chemical formulas (case sensitive) for precise matching</b>
     </div>
     <div style='margin-top:8px;background:#e6f7ff;padding:8px;border-radius:4px'>
-    <b>结果优先显示本库高频期刊论文，物理期刊用蓝色背景突出</b>
+    <b>Results are sorted by the most frequent journals in your library. Physics journals are highlighted in blue.</b>
     </div>
     </div>
     """)
 
-    bib_input = gr.File(label="上传本地 BibTeX 文件（推荐）", file_types=[".bib"])
-    keywords_input = gr.Textbox(label="检索关键词 (逗号分隔)", value="", scale=3)
-    species_input = gr.Textbox(label="Active Species/分子 (逗号分隔)", value="NO", scale=2)
-    perturber_input = gr.Textbox(label="Perturbers/缓冲气 (逗号分隔)", value="N2", scale=2)
+    bib_input = gr.File(label="Upload local BibTeX file (recommended)", file_types=[".bib"])
+    keywords_input = gr.Textbox(label="Search keywords (comma separated)", value="", scale=3)
+    species_input = gr.Textbox(label="Active Species (comma separated)", value="NO", scale=2)
+    perturber_input = gr.Textbox(label="Perturbers (comma separated)", value="N2", scale=2)
     with gr.Row():
-        min_year_input = gr.Number(label="最早年份 (可选)", value=DEFAULT_MIN_YEAR, precision=0, scale=1)
-        max_year_input = gr.Number(label="最晚年份 (可选)", value=DEFAULT_MAX_YEAR, precision=0, scale=1)
-        max_results_input = gr.Number(label="最大检索数(建议≤5000)", value=1000, precision=0, scale=2)
-    journal_filter_checkbox = gr.Checkbox(label="仅限物理相关期刊", value=True)
-    search_btn = gr.Button("查找文献", scale=1)
+        min_year_input = gr.Number(label="Earliest year (optional)", value=DEFAULT_MIN_YEAR, precision=0, scale=1)
+        max_year_input = gr.Number(label="Latest year (optional)", value=DEFAULT_MAX_YEAR, precision=0, scale=1)
+        max_results_input = gr.Number(label="Max results (≤5000 suggested)", value=1000, precision=0, scale=2)
+    journal_filter_checkbox = gr.Checkbox(label="Only physics journals", value=True)
+    search_btn = gr.Button("Search", scale=1)
     with gr.Row():
-        prev_btn = gr.Button("上一页", scale=1)
-        next_btn = gr.Button("下一页", scale=1)
-        csv_btn = gr.Button("导出为CSV", scale=2)
+        prev_btn = gr.Button("Previous page", scale=1)
+        next_btn = gr.Button("Next page", scale=1)
+        csv_btn = gr.Button("Export as CSV", scale=2)
         csv_output = gr.File(label="", visible=False)
     result_html = gr.HTML()
     results_state = gr.State([])
