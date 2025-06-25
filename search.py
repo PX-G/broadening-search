@@ -372,6 +372,12 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     query_kw_state = gr.State([])
 
     def do_search(bibfile, kw, sp, pe, miny, maxy, mx, journal_filter):
+        # 1. 解析本地bib文件
+        bibstr = bibfile_to_str(bibfile)
+        bib_results = []
+        keywords = [k.strip() for k in kw.split(",") if k.strip()]
+        species = [s.strip() for s in sp.split(",") if s.strip()]
+        perturber = [p.strip() for p in pe.split(",") if p.strip()]
         try:
             miny = int(miny) if miny else DEFAULT_MIN_YEAR
             maxy = int(maxy) if maxy else DEFAULT_MAX_YEAR
@@ -379,28 +385,25 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         try:
             mx = int(mx) if mx else 1000
         except: mx = 1000
-        keywords = [k.strip() for k in kw.split(",") if k.strip()]
-        species = [s.strip() for s in sp.split(",") if s.strip()]
-        perturber = [p.strip() for p in pe.split(",") if p.strip()]
-        bibstr = bibfile_to_str(bibfile)
-        results = []
+        # --- 本地bib优先 ---
         if bibstr:
-            results = bib_match_entries(bibstr, keywords, species, perturber, miny, maxy, journal_filter)
-        if not results:
-            # 构建查询时区分化学式和其他关键词
-            query_parts = []
-            for s in species:
-                if is_chemical_formula(s):
-                    query_parts.append(f'"{s}"')  # 化学式加引号确保精确匹配
-                else:
-                    query_parts.append(s)
-            query_parts.extend(keywords)
-            query_parts.extend(perturber)
-            query_str = " AND ".join(query_parts)
-            results = search_crossref(query_str, mx, miny, maxy, journal_filter)
-        results = deduplicate_papers(results)
-        html = format_results_html(results, 1, keywords+species+perturber)
-        return html, results, 1, keywords+species+perturber
+            bib_results = bib_match_entries(bibstr, keywords, species, perturber, miny, maxy, journal_filter)
+            if bib_results:
+                bib_results = deduplicate_papers(bib_results)
+                html = format_results_html(bib_results, 1, keywords + species + perturber)
+                return html, bib_results, 1, keywords + species + perturber
+        # --- 仅无本地结果时，才查CrossRef ---
+        query_str = " AND ".join(keywords + species + perturber)
+        cr_results = search_crossref(query_str, mx, miny, maxy, journal_filter)
+        # 只保留title/abstract含有“broadening”/“pressure”/“collision”/“rotational”等的论文
+        FILTER_TERMS = ['broadening', 'pressure', 'collision', 'rotational', 'linewidth', 'absorption', 'shift']
+        def is_relevant(item):
+            txt = (item['Title'] + " " + item.get('Journal',"")).lower()
+            return any(t in txt for t in FILTER_TERMS)
+        cr_results = [r for r in cr_results if is_relevant(r)]
+        cr_results = deduplicate_papers(cr_results)
+        html = format_results_html(cr_results, 1, keywords + species + perturber)
+        return html, cr_results, 1, keywords + species + perturber
 
     def turn_page(results, page, keywords, direction):
         page = page + direction
