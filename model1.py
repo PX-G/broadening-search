@@ -12,7 +12,7 @@ from datetime import datetime
 
 # ====== CONFIG =======
 OPENROUTER_API_KEY = "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"
-LLM_MODEL = "moonshotai/kimi-k2:free"
+LLM_MODEL = "deepseek/deepseek-chat-v3-0324:free"
 PAGE_SIZE = 20
 
 PHYSICS_JOURNALS = [
@@ -220,7 +220,7 @@ def export_results_csv(results):
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
-    # Spectral Line Broadening Literature Search (moonshotai/kimi-k2:free)
+    # Spectral Line Broadening Literature Search (deepseek/deepseek-chat-v3-0324:free)
     <div style='color:#444;font-size:15px;margin-bottom:10px'>
     Use keywords, active species, perturbers and physics journal filter to maximize recall for pressure broadening parameter literature. Click DOI to copy. Download CSV for batch processing.
     </div>
