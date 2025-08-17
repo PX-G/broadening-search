@@ -1,70 +1,137 @@
+#LLM_MODEL: moonshotai/kimi-k2:free
+# Spectral line broadening literature search (Crossref + heuristic + batch LLM)
+# - Stable sort: Journal priority (JQSRT → JMS → JCP) → Year → Title
+# - Optional hard filter: species/perturber must appear in title/abstract
+# - Global requests Session with retry/backoff
+# -----------------------------------------------------------------------------
+
 import os
 import certifi
 os.environ["SSL_CERT_FILE"] = certifi.where()
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import gradio as gr
-import csv
-import io
 import re
-from collections import Counter
-from datetime import datetime
+import json
+import string
+from typing import List, Dict, Tuple
 
 # ====== CONFIG =======
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("Missing OPENROUTER_API_KEY environment variable.")
+
 LLM_MODEL = "moonshotai/kimi-k2:free"
 PAGE_SIZE = 20
 
+# Global Session (retry/backoff)
+def build_session():
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"])
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "broadening-search/1.6 (mailto:your_email@ucl.ac.uk)"})
+    return s
+
+SESSION = build_session()
+
+# Physics journals (exact names/prefix)
 PHYSICS_JOURNALS = [
-    "Physical Review", "Journal of Chemical Physics", "Journal of Molecular Structure", "Journal of Quantitative Spectroscopy and Radiative Transfer",
-    "Journal of Molecular Spectroscopy", "Astrophysical Journal", "Astronomy & Astrophysics", "Molecular Physics",
-    "Chemical Physics Letters", "Journal of Physical Chemistry", "Journal of Geophysical Research", "Icarus",
-    "Planetary and Space Science", "Optics Express", "Applied Optics", "Spectrochimica Acta Part A",
-    "Journal of the Optical Society of America", "Chemical Physics",
-    "Atmospheric Chemistry and Physics", "Journal of Atmospheric Sciences", "Physics Letters A",
-    "Physical Chemistry Chemical Physics", "Review of Scientific Instruments", "Journal of Applied Physics",
-    "Journal of Physics B", "Journal of Physics D", "Journal of Physics: Condensed Matter", "Physics of Fluids",
-    "Physics of Plasmas", "Physics Today", "Nature Physics", "Science", "Physics Reports", "Physics Letters B",
-    "Nuclear Physics", "Physical Review Letters", "Physical Review A", "Physical Review B", "Physical Review C",
-    "Physical Review D", "Physical Review E", "Physical Review Applied", "Physical Review X", "Physical Review Fluids",
-    "Physical Review Materials", "Physical Review Physics Education Research", "Physical Review Research",
-    "Physical Review Accelerators and Beams", "Physical Review Special Topics - Accelerators and Beams"
+    "Physical Review", "Physical Review Letters",
+    "Physical Review A", "Physical Review B", "Physical Review C", "Physical Review D",
+    "Physical Review E", "Physical Review X", "Physical Review Applied",
+    "Physical Review Fluids", "Physical Review Materials",
+    "Journal of Chemical Physics",
+    "Journal of Molecular Spectroscopy",
+    "Journal of Quantitative Spectroscopy and Radiative Transfer",
+    "Molecular Physics",
+    "Review of Scientific Instruments",
+    "Journal of Physics B",
+    "Journal of Physics D",
+    "Journal of Physics: Condensed Matter",
+    "Optics Express",
+    "Applied Optics",
+    "Journal of the Optical Society of America",
+    "Spectrochimica Acta Part A: Molecular and Biomolecular Spectroscopy"
 ]
 
-PARAM_KEYWORDS = [
-    "gamma", "γ", "pressure broadening coefficient", "temperature exponent", "n=", "γ=",
-    "measured", "measurement", "experimental", "value", "fit", "uncertainty",
-    "cm-1 atm-1", "reported", "determined", "parameters", "obtained", "tabulated", "table",
-    "J =", "K =", "data", "coefficient", "result", "parameter", "shift", "pressure", "rotational",
-    "collision", "dependence", "determination", "half-width", "linewidth", "spectra", "temperature", 
-    "comparison", "collisional", "intensity", "narrowing", "vibration", "overtone", "band", "transition", 
-    "calculation","absorption", "theory", "data"
+# Journal priority (JQSRT → JMS → JCP)
+JOURNAL_PRIORITY = [
+    "Journal of Quantitative Spectroscopy and Radiative Transfer",  # JQSRT
+    "Journal of Molecular Spectroscopy",                            # JMS
+    "Journal of Chemical Physics"                                   # JCP
 ]
 
-def is_physics_journal(journal_name):
-    if not journal_name:
+# Heuristic keywords (includes legacy phrasing)
+PARAM_HEURISTICS = [
+    "pressure broadening", "pressure-broadened", "collisional broadening",
+    "line broadening", "linewidth", "halfwidth", "half-width",
+    "voigt", "line shape", "lineshape", "broadening coefficient",
+    "gamma", "pressure shift", "line shift", "temperature exponent",
+    "lorentz", "lorentzian", "hwhm", "fwhm",
+    "air-broadened", "self-broadened", "n2-broadened", "o2-broadened",
+    "line-mixing", "foreign broadening"
+]
+
+# Default query terms (UI can override)
+DEFAULT_QUERY_TERMS = [
+    "pressure broadening", "line broadening", "linewidth", "half-width", "halfwidth",
+    "Voigt", "broadening coefficient", "gamma", "pressure shift", "temperature exponent", "line shape"
+]
+
+# -----------------------------------------------------------------------------
+# Normalization / utilities
+# -----------------------------------------------------------------------------
+
+def _norm_journal(name: str) -> str:
+    if not name:
+        return ""
+    s = name.lower()
+    s = s.replace("&", "and")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+_PHYSICS_SET = {_norm_journal(j) for j in PHYSICS_JOURNALS}
+_PHYSICS_PREFIXES = {_norm_journal(p) for p in ["Physical Review"]}
+_PRIORITY_MAP = {_norm_journal(j): i for i, j in enumerate(JOURNAL_PRIORITY)}
+
+def is_physics_journal(journal_name: str) -> bool:
+    n = _norm_journal(journal_name)
+    if not n:
         return False
-    journal_lower = journal_name.lower()
-    return any(physics_journal.lower() in journal_lower for physics_journal in PHYSICS_JOURNALS)
+    return (n in _PHYSICS_SET) or any(n.startswith(p) for p in _PHYSICS_PREFIXES)
 
-def highlight_keywords(text, keywords):
-    if not text: return ""
-    for kw in keywords:
-        if kw.strip():
-            pattern = r'\b' + re.escape(kw) + r'\b'
-            text = re.sub(pattern, lambda m: f'<mark style="background:#ffe066;border-radius:3px;padding:1px 3px">{m.group(0)}</mark>', text, flags=re.IGNORECASE)
-    return text
+def priority_score(journal_name: str) -> int:
+    """0,1,2 for JQSRT/JMS/JCP; others → 999"""
+    n = _norm_journal(journal_name)
+    return _PRIORITY_MAP.get(n, 999)
 
-def get_key(entry):
+def strip_tags(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)  # remove JATS/HTML
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def get_key(entry: Dict) -> str:
     doi = (entry.get('DOI', '') or '').strip().lower()
     if doi:
         return "doi:" + doi
-    title = (entry.get('Title', '') or '').strip().lower()
-    authors = (entry.get('Authors', '') or '').strip().lower()
-    short = "".join(authors.split()[:2])
-    return "title:" + title + "|auth:" + short
+    title = (entry.get('Title','') or '').lower()
+    title = title.translate(str.maketrans('', '', string.punctuation))
+    title = re.sub(r"\s+", " ", title).strip()
+    first_author = (entry.get('Authors','') or '').split(",")[0].lower().strip()
+    return f"title:{title}|fa:{first_author}"
 
-def deduplicate_papers(papers):
+def deduplicate_papers(papers: List[Dict]) -> List[Dict]:
     seen = set()
     unique = []
     for p in papers:
@@ -74,105 +141,282 @@ def deduplicate_papers(papers):
             seen.add(key)
     return unique
 
-def search_crossref_multi(keywords, species, perturbers, max_results=500, min_year=2000, max_year=2025, physics_journals_only=False):
-    all_results = []
-    # For recall, combine all search terms into one big query
-    query_terms = list(filter(None, keywords + species + perturbers))
-    # At least use parameter keywords if user does not input
-    if not query_terms:
-        query_terms = PARAM_KEYWORDS
-    query_str = " AND ".join(query_terms)
-    params = {
-        "query.bibliographic": query_str,
-        "rows": max_results,
-        "sort": "issued",
-        "order": "desc"
-    }
-    try:
-        resp = requests.get("https://api.crossref.org/works", params=params, timeout=60)
-        items = resp.json().get("message", {}).get("items", [])
-        for item in items:
-            title = (item.get("title") or [""])[0] or ""
-            authors = ", ".join(f"{p.get('given','')} {p.get('family','')}".strip() for p in item.get("author", []))
-            pub = item.get("published-print", item.get("published-online", {}))
-            year = pub.get("date-parts", [[None]])[0][0]
-            try: year_val = int(year)
-            except: year_val = None
-            if min_year and year_val and year_val < min_year:
-                continue
-            if max_year and year_val and year_val > max_year:
-                continue
-            journal = (item.get("container-title") or [""])[0]
-            if physics_journals_only and journal and not is_physics_journal(journal):
-                continue
-            doi = item.get("DOI", "")
-            abstract = item.get("abstract", "")
-            all_results.append({
-                "Title": title,
-                "Authors": authors,
-                "Year": year,
-                "Journal": journal,
-                "DOI": doi,
-                "Abstract": abstract
-            })
-    except Exception as e:
-        print("CrossRef search error:", e)
-    all_results = deduplicate_papers(all_results)
-    return all_results
+def highlight_keywords(text: str, keywords: List[str]) -> str:
+    if not text:
+        return ""
+    uniq = sorted({kw.strip() for kw in keywords if kw.strip()}, key=len, reverse=True)
+    for kw in uniq:
+        pat = r'(?<![\w])' + re.escape(kw) + r'(?![\w])'
+        text = re.sub(
+            pat,
+            lambda m: f'<mark style="background:#ffe066;border-radius:3px;padding:1px 3px">{m.group(0)}</mark>',
+            text,
+            flags=re.IGNORECASE
+        )
+    return text
 
-def llm_filter(entries, keywords, species, perturbers):
-    filtered = []
-    for entry in entries:
-        # 宽松召回+高容错 prompt
-        content = f"""Title: {entry['Title']}\nAbstract: {entry.get('Abstract','')}\nJournal: {entry.get('Journal','')}\n"""
-        prompt = (
-            "You are an expert in molecular spectroscopy. "
-            "Does the following paper discuss, even possibly, any experimental data, measurements, or physical parameters "
-            "related to molecular spectral line broadening (pressure broadening) or related quantities (e.g. gamma, n, shift, linewidth, cross section, etc)? "
-            "If YES, even if it is uncertain or ambiguous, please answer 'Relevant: ...' with a brief summary. "
-            "If the information is insufficient to decide, please ERR ON THE SIDE OF INCLUDING IT and answer as 'Relevant: ...'. "
-            "Only answer 'Irrelevant' if you are absolutely sure the paper has NO connection to experimental/parameter data for spectral line broadening. "
-            "----\n"
-            f"{content}"
-            "----\n"
-            "Your answer should be:\n"
-            "\"Relevant: \" + a one-sentence summary, or \"Irrelevant\". Only output this phrase."
+# -----------------------------------------------------------------------------
+# Stable sort: Priority (JQSRT→JMS→JCP) → Year → Title
+# -----------------------------------------------------------------------------
+
+def _safe_year(y):
+    try:
+        return int(y)
+    except Exception:
+        return None
+
+def _norm_title(t: str) -> str:
+    return re.sub(r"\s+", " ", (t or "").strip().lower())
+
+def sort_results_stable(results, year_order: str = "desc", prioritize: bool = True):
+    """
+    Stable key: (priority, year, title)
+    - priority: 0/1/2 for JQSRT/JMS/JCP when prioritize=True, else 999
+    - year: None always last; descending or ascending
+    - title: normalized, as tie-breaker for consistent pagination
+    """
+    desc = (year_order.lower().startswith("d"))
+
+    def key_fn(r):
+        prio = priority_score(r.get("Journal")) if prioritize else 999
+        y = _safe_year(r.get("Year"))
+        if desc:
+            year_key = (y is None, -(y or 0))
+        else:
+            year_key = (y is None, (y or 10**9))
+        return (prio, year_key, _norm_title(r.get("Title")))
+
+    return sorted(results, key=key_fn)
+
+# -----------------------------------------------------------------------------
+# Crossref multi-strategy search (union + dedup + soft-denoise)
+# -----------------------------------------------------------------------------
+
+def search_crossref_multi(keywords, species, perturbers,
+                          max_results=500, min_year=2000, max_year=2025,
+                          physics_journals_only=False, order="desc") -> List[Dict]:
+    def _call(params):
+        try:
+            r = SESSION.get("https://api.crossref.org/works", params=params, timeout=60)
+            r.raise_for_status()
+            return r.json().get("message", {}).get("items", [])
+        except Exception:
+            return []
+
+    user_terms = [t.strip() for t in (keywords or []) if t.strip()]
+    base_terms = user_terms or DEFAULT_QUERY_TERMS
+
+    sp = " ".join(species or [])
+    pe = " ".join(perturbers or [])
+    specie_block = " ".join([sp, pe]).strip()
+
+    broaden_sets = [
+        "pressure broadening",
+        "collisional broadening",
+        "line broadening",
+        "linewidth half-width halfwidth",
+        "Voigt lineshape line shape",
+        "broadening coefficient gamma",
+        "pressure shift line shift",
+        "temperature exponent n",
+        "Lorentz Lorentzian HWHM FWHM"
+    ]
+
+    query_strings = []
+    if base_terms:
+        query_strings.append(" ".join(base_terms + ([specie_block] if specie_block else [])))
+    for s in broaden_sets:
+        qs = " ".join([s, specie_block]).strip() if specie_block else s
+        query_strings.append(qs)
+    query_strings = list(dict.fromkeys([q for q in query_strings if q]))
+
+    strategies = [("query", None), ("query.title", None), ("query.bibliographic", None)]
+    base_filter = f"from-pub-date:{min_year}-01-01,until-pub-date:{max_year}-12-31,type:journal-article"
+
+    pool = []
+    for q in query_strings:
+        for field, _ in strategies:
+            params = {
+                field: q,
+                "filter": base_filter,
+                "rows": max_results,
+                "select": "title,author,issued,container-title,DOI,abstract",
+                "sort": "issued",
+                "order": order
+            }
+            items = _call(params)
+            for item in items:
+                title = (item.get("title") or [""])[0] or ""
+                authors = ", ".join(f"{p.get('given','')} {p.get('family','')}".strip() for p in item.get("author", []))
+                year = None
+                issued = item.get("issued", {})
+                if "date-parts" in issued and issued["date-parts"] and issued["date-parts"][0]:
+                    year = issued["date-parts"][0][0]
+                if year is None and "created" in item and "date-parts" in item["created"]:
+                    try:
+                        year = item["created"]["date-parts"][0][0]
+                    except Exception:
+                        year = None
+                journal = (item.get("container-title") or [""])[0]
+                doi = item.get("DOI", "")
+                abstract = strip_tags(item.get("abstract") or "")
+                pool.append({
+                    "Title": title, "Authors": authors, "Year": year, "Journal": journal, "DOI": doi, "Abstract": abstract
+                })
+
+    pool = deduplicate_papers(pool)
+
+    if physics_journals_only:
+        pool = [r for r in pool if is_physics_journal(r.get("Journal"))]
+
+    # Soft negative filter: CIA-only, high-energy physics, etc.
+    soft_neg = [
+        "collision-induced absorption", " cia ",
+        "gamma ray", "neutrino", "proton", "hadron", "quark", "collider",
+        "heavy-ion", "brownian", "quantum chromodynamics", "phase transition in lattice",
+        "optical clock", "frequency comb", "microresonator", "laser cavity linewidth"
+    ]
+    must_pos = [
+        "broadening", "linewidth", "half-width", "halfwidth",
+        "voigt", "broadening coefficient", "gamma", "line shift",
+        "lorentz", "lorentzian", "hwhm", "fwhm"
+    ]
+
+    cleaned = []
+    for r in pool:
+        s = (r.get("Title","") + " " + r.get("Abstract","")).lower()
+        if any(neg in s for neg in soft_neg) and not any(pos in s for pos in must_pos):
+            continue
+        cleaned.append(r)
+
+    return cleaned
+
+# -----------------------------------------------------------------------------
+# Heuristic sort + batch LLM filtering (recall-first)
+# -----------------------------------------------------------------------------
+
+def coarse_filter(entries: List[Dict], top_k: int | None = None) -> Tuple[List[Dict], int]:
+    scored = []
+    for e in entries:
+        s = (e.get("Title","") + " " + (e.get("Abstract","") or "")).lower()
+        hits = sum(1 for w in PARAM_HEURISTICS if w in s)
+        if e.get("Abstract"):
+            hits += 0.5
+        scored.append((hits, e))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if top_k is None:
+        top_k = len(scored)
+    keep = [e for _, e in scored][:min(top_k, len(scored))]
+    return keep, len(keep)
+
+def llm_filter(entries: List[Dict],
+               keywords: List[str],
+               species: List[str],
+               perturbers: List[str],
+               batch_size: int = 30,
+               heur_cap: int | None = None) -> Tuple[List[Dict], Dict]:
+    kept: List[Dict] = []
+    meta = {"coarse": 0, "batches": 0}
+    if not entries:
+        return kept, meta
+
+    cand, coarse_n = coarse_filter(entries, top_k=heur_cap)  # None = keep all
+    meta["coarse"] = coarse_n
+
+    def build_payload(chunk: List[Dict]) -> List[Dict]:
+        records = []
+        for idx, e in enumerate(chunk):
+            t = (e.get("Title") or "")[:300]
+            a = (e.get("Abstract") or "").replace("\n", " ")
+            a = a[:1200]
+            j = (e.get("Journal") or "")[:100]
+            records.append({"i": idx, "title": t, "abstract": a, "journal": j})
+        return records
+
+    def call_llm(records: List[Dict]) -> List[Dict]:
+        sys_prompt = (
+            "You are an expert in molecular/atomic spectroscopy (gas-phase). "
+            "For each paper, decide if it likely reports EXPERIMENTAL line-shape or pressure-broadening "
+            "parameters for molecular/atomic transitions (e.g., Lorentz/Voigt width HWHM/FWHM, gamma, "
+            "temperature exponent n, pressure/line shift) typically in IR/visible/microwave spectra. "
+            "EXCLUDE particle/nuclear/high-energy physics (gamma rays, neutrinos, proton collisions, colliders), "
+            "solid-state or laser-cavity linewidths without gas-phase collisions, generic optics (optical clocks), "
+            "and unrelated Brownian/transport statistics. "
+            "Be inclusive only if it plausibly contains measured broadening parameters. "
+            "Return a JSON array with objects: {i:<index>, relevant:true/false, reason:<short>}."
+        )
+        user_prompt = "PAPERS:\n" + "\n".join(
+            [f"[{r['i']}] Title: {r['title']}\nAbstract: {r['abstract']}\nJournal: {r['journal']}" for r in records]
         )
         try:
-            resp = requests.post(
+            resp = SESSION.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "HTTP-Referer": "https://chat.openai.com",
-                    "X-Title": "broadening-llm"
+                    "X-Title": "broadening-llm-batch"
                 },
                 json={
                     "model": LLM_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 128,
-                    "temperature": 0.2,
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "max_tokens": 700,
+                    "temperature": 0.0,
+                    "response_format": {"type": "json_object"}
                 },
-                timeout=30
+                timeout=60
             )
-            ans = resp.json()["choices"][0]["message"]["content"]
-            # 只要不是严格“irrelevant”都保留
-            if ans.strip().lower().startswith("relevant"):
-                entry["LLM"] = ans.replace("\n","")
-                filtered.append(entry)
-            elif "not enough" in ans.lower() or "cannot judge" in ans.lower() or "unsure" in ans.lower():
-                entry["LLM"] = ans.replace("\n","")
-                filtered.append(entry)
-        except Exception as e:
-            entry["LLM"] = f"LLM error: {str(e)}"
-            # 筛选出错也保留
-            filtered.append(entry)
-    return filtered
+            content = resp.json()["choices"][0]["message"]["content"]
+            try:
+                data = json.loads(content)
+            except Exception:
+                m = re.search(r"\[.*\]", content, re.S)
+                data = json.loads(m.group(0)) if m else []
 
-def format_results_html(results, page=1, keywords=[]):
+            if isinstance(data, dict) and "results" in data:
+                arr = data["results"]
+            elif isinstance(data, list):
+                arr = data
+            else:
+                arr = data.get("data", data.get("papers", [])) if isinstance(data, dict) else []
+            return arr
+        except Exception as e:
+            return [{"i": r["i"], "relevant": True, "reason": f"fallback: {e}"} for r in records]
+
+    for start in range(0, len(cand), batch_size):
+        chunk = cand[start:start+batch_size]
+        payload = build_payload(chunk)
+        meta["batches"] += 1
+        results = call_llm(payload) or []
+        for r in results:
+            try:
+                i = int(r.get("i", -1))
+            except:
+                i = -1
+            if 0 <= i < len(chunk):
+                original = cand[start + i]
+                if r.get("relevant", True):
+                    original["LLM"] = f"Relevant: {r.get('reason','')}"
+                    kept.append(original)
+        if not results:
+            for original in chunk:
+                original["LLM"] = "Relevant: fallback empty"
+                kept.append(original)
+
+    kept = deduplicate_papers(kept)
+    return kept, meta
+
+# -----------------------------------------------------------------------------
+# Render
+# -----------------------------------------------------------------------------
+
+def format_results_html(results: List[Dict], page: int = 1, keywords: List[str] = []) -> str:
     total = len(results)
-    start = (page-1)*PAGE_SIZE
-    end = min(start+PAGE_SIZE, total)
+    start = (page - 1) * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
     shown = results[start:end]
+
     html = """
     <style>
     .table-bib {border-collapse:collapse;width:99%;font-size:15px;}
@@ -189,112 +433,153 @@ def format_results_html(results, page=1, keywords=[]):
     for col in ["#", "Title", "Authors", "Year", "Journal", "DOI"]:
         html += f'<th>{col}</th>'
     html += '</tr></thead><tbody>'
+
     for i, r in enumerate(shown, start=start+1):
-        journal_class = "physics-journal" if is_physics_journal(r["Journal"]) else ""
+        journal_class = "physics-journal" if is_physics_journal(r.get("Journal")) else ""
         html += f'<tr class="{journal_class}">'
         html += f'<td style="text-align:center;">{i}</td>'
-        html += f'<td>{highlight_keywords(r["Title"], keywords)}</td>'
-        author_short = (r["Authors"][:35] + ("…" if len(r["Authors"])>35 else "")) if r["Authors"] else ""
-        html += f'<td title="{r["Authors"]}" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{author_short}</td>'
-        html += f'<td style="text-align:center;">{r["Year"] or ""}</td>'
-        html += f'<td>{r["Journal"]}</td>'
-        doi_display = r["DOI"] or ""
+        html += f'<td>{highlight_keywords(r.get("Title",""), keywords)}</td>'
+
+        authors_full = r.get("Authors","") or ""
+        author_short = (authors_full[:35] + ("…" if len(authors_full) > 35 else ""))
+        html += f'<td title="{authors_full}" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{author_short}</td>'
+
+        html += f'<td style="text-align:center;">{r.get("Year","") or ""}</td>'
+        html += f'<td>{r.get("Journal","") or ""}</td>'
+
+        doi_display = r.get("DOI","") or ""
         if doi_display:
-            html += f'''<td><a href="https://doi.org/{doi_display}" target="_blank" style="color:#2d79c7;text-decoration:underline" onclick="navigator.clipboard.writeText('{doi_display}')">{doi_display}</a></td>'''
+            html += (f'''<td><a href="https://doi.org/{doi_display}" target="_blank" '''
+                     f'''style="color:#2d79c7;text-decoration:underline" '''
+                     f'''onclick="navigator.clipboard.writeText('{doi_display}')">{doi_display}</a></td>''')
         else:
             html += "<td></td>"
+
         html += '</tr>'
+
+    pages = max(1, (total - 1) // PAGE_SIZE + 1)
     html += '</tbody></table>'
-    html += f'<div style="padding:6px;text-align:right;color:#666">Total <b>{total}</b> entries, page <b>{page}</b> / <b>{(total-1)//PAGE_SIZE+1}</b></div>'
+    html += f'<div style="padding:6px;text-align:right;color:#666">Total <b>{total}</b> entries, page <b>{page}</b> / <b>{pages}</b></div>'
     html += f'<div style="padding:6px;background:#e6f7ff;border-radius:4px;margin-top:8px">Blue background: Physics journal</div>'
     html += '</div>'
     return html
 
-def export_results_csv(results):
-    csv_buffer = io.StringIO()
-    writer = csv.DictWriter(csv_buffer, fieldnames=["Title", "Authors", "Year", "Journal", "DOI"])
-    writer.writeheader()
-    for r in results:
-        writer.writerow({k: r.get(k, "") for k in ["Title", "Authors", "Year", "Journal", "DOI"]})
-    return csv_buffer.getvalue().encode("utf-8")
+# -----------------------------------------------------------------------------
+# Gradio UI
+# -----------------------------------------------------------------------------
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("""
-    # Spectral Line Broadening Literature Search (moonshotai/kimi-k2:free)
+    gr.Markdown(f"""
+    # Spectral Line Broadening Literature Search ({LLM_MODEL})
     <div style='color:#444;font-size:15px;margin-bottom:10px'>
-    Use keywords, active species, perturbers and physics journal filter to maximize recall for pressure broadening parameter literature. Click DOI to copy. Download CSV for batch processing.
+    Use keywords, active species, perturbers and physics journal filter to maximize recall for pressure broadening parameter literature.
+    Click DOI to copy.
     </div>
     """)
 
-    keywords_input = gr.Textbox(label="Search keywords (comma separated)", value="", placeholder="pressure broadening, gamma, shift, ...")
+    keywords_input = gr.Textbox(
+        label="Search keywords (comma separated)",
+        value="pressure broadening, linewidth, halfwidth, Voigt, gamma, shift, Lorentz, HWHM, FWHM",
+        placeholder="pressure broadening, gamma, shift, ..."
+    )
     species_input = gr.Textbox(label="Active Species (comma separated)", value="", placeholder="CO2, NO, H2O ...")
-    perturber_input = gr.Textbox(label="Perturbers (comma separated)", value="", placeholder="N2, O2, He ...")
+    perturber_input = gr.Textbox(label="Perturbers (comma separated)", value="", placeholder="N2, O2, He, H2, air ...")
     max_results_input = gr.Number(label="Max results", value=500, precision=0)
     min_year_input = gr.Number(label="Earliest year", value=2000, precision=0)
     max_year_input = gr.Number(label="Latest year", value=2025, precision=0)
     journal_filter_checkbox = gr.Checkbox(label="Only physics journals", value=True)
-    search_btn = gr.Button("Search", scale=1)
-    prev_btn = gr.Button("Previous page", scale=1)
-    next_btn = gr.Button("Next page", scale=1)
-    csv_btn = gr.Button("Export as CSV", scale=2)
-    csv_output = gr.File(label="", visible=False)
+
+    # Controls: hard filter, heuristic cap, year order, prioritization
+    require_species_chk = gr.Checkbox(label="Require species/perturber in title/abstract", value=False)
+    heur_cap_input = gr.Number(label="Heuristic cap (0 = keep all)", value=0, precision=0)
+    order_dropdown = gr.Dropdown(
+        label="Sort by year",
+        choices=["DESC (newest first)", "ASC (oldest first)"],
+        value="DESC (newest first)"
+    )
+    prioritize_chk = gr.Checkbox(label="Prioritize journals (JQSRT → JMS → JCP first)", value=True)
+
+    with gr.Row():
+        search_btn = gr.Button("Search", scale=1)
+        prev_btn = gr.Button("Previous page", scale=1)
+        next_btn = gr.Button("Next page", scale=1)
+
     result_html = gr.HTML()
     results_state = gr.State([])
     page_state = gr.State(1)
-    log_output = gr.Textbox(label="Log", value="", lines=6)
+    kw_all_state = gr.State([])
+    log_output = gr.Textbox(label="Log", value="", lines=8)
 
-    def do_search(kw, sp, pe, mx, miny, maxy, journal_filter):
-        log_msgs = ["Starting CrossRef search..."]
+    def do_search(kw, sp, pe, mx, miny, maxy, journal_filter, require_species, heur_cap, order_choice, prioritize):
+        log_msgs = []
         mx = int(mx) if mx else 500
         miny = int(miny) if miny else 2000
         maxy = int(maxy) if maxy else 2025
-        keywords = [k.strip() for k in kw.split(",") if k.strip()]
-        species = [s.strip() for s in sp.split(",") if s.strip()]
-        perturber = [p.strip() for p in pe.split(",") if p.strip()]
-        all_results = search_crossref_multi(keywords, species, perturber, max_results=mx, min_year=miny, max_year=maxy, physics_journals_only=journal_filter)
-        log_msgs.append(f"Fetched {len(all_results)} records...")
-        log_msgs.append("Applying LLM filter for experimental/parameter papers ...")
-        filtered = llm_filter(all_results, keywords, species, perturber)
-        log_msgs.append(f"After LLM filter: {len(filtered)} remain ...")
-        html = format_results_html(filtered, 1, keywords + species + perturber)
-        log_msgs.append("Done.")
-        return html, filtered, 1, "\n".join(log_msgs)
+        cap = int(heur_cap) if heur_cap else 0  # 0 = keep all
+        order = "desc" if "DESC" in (order_choice or "").upper() else "asc"
 
-    def turn_page(results, page, direction):
+        keywords = [k.strip() for k in (kw or "").split(",") if k.strip()]
+        species = [s.strip() for s in (sp or "").split(",") if s.strip()]
+        perturber = [p.strip() for p in (pe or "").split(",") if p.strip()]
+        if not perturber:
+            perturber = ["N2", "O2", "He", "H2", "air"]
+
+        log_msgs.append("Starting CrossRef search (expanded multi-strategy)...")
+        all_results = search_crossref_multi(
+            keywords, species, perturber,
+            max_results=mx, min_year=miny, max_year=maxy,
+            physics_journals_only=journal_filter, order=order
+        )
+        log_msgs.append(f"Fetched (after merge/dedup/soft-neg): {len(all_results)} records")
+
+        if require_species and (species or perturber):
+            toks = [t.lower() for t in (species + perturber)]
+            def has_tok(r):
+                s = (r.get("Title","") + " " + (r.get("Abstract","") or "")).lower()
+                return any(t in s for t in toks)
+            before = len(all_results)
+            all_results = [r for r in all_results if has_tok(r)]
+            log_msgs.append(f"Require species/perturber ON: {before} → {len(all_results)}")
+
+        log_msgs.append("Applying heuristic + batch LLM filter ...")
+        filtered, meta = llm_filter(all_results, keywords, species, perturber, heur_cap=(None if cap==0 else cap))
+        log_msgs.append(f"After heuristic: {meta.get('coarse', 0)} candidates; LLM kept: {len(filtered)} (batches={meta.get('batches',0)})")
+
+        # Stable sort: Priority → Year → Title
+        filtered = sort_results_stable(filtered, year_order=order, prioritize=prioritize)
+
+        kw_all = keywords + species + perturber
+        html = format_results_html(filtered, 1, kw_all)
+        log_msgs.append("Done.")
+        return html, filtered, 1, kw_all, "\n".join(log_msgs)
+
+    def turn_page(results, page, kw_all, direction):
         page = page + direction
         total = len(results)
-        maxpage = max(1, (total-1)//PAGE_SIZE+1)
-        if page < 1: page = 1
-        if page > maxpage: page = maxpage
-        html = format_results_html(results, page)
+        maxpage = max(1, (total - 1) // PAGE_SIZE + 1)
+        page = min(max(page, 1), maxpage)
+        html = format_results_html(results, page, kw_all)
         return html, page
-
-    def export_csv(results):
-        tempname = "broadening_results.csv"
-        with open(tempname, "wb") as f:
-            f.write(export_results_csv(results))
-        return tempname
 
     search_btn.click(
         fn=do_search,
-        inputs=[keywords_input, species_input, perturber_input, max_results_input, min_year_input, max_year_input, journal_filter_checkbox],
-        outputs=[result_html, results_state, page_state, log_output]
+        inputs=[
+            keywords_input, species_input, perturber_input,
+            max_results_input, min_year_input, max_year_input,
+            journal_filter_checkbox, require_species_chk, heur_cap_input,
+            order_dropdown, prioritize_chk
+        ],
+        outputs=[result_html, results_state, page_state, kw_all_state, log_output]
     )
-
     prev_btn.click(
-        lambda res, p: turn_page(res, p, -1),
-        inputs=[results_state, page_state],
+        lambda res, p, kwa: turn_page(res, p, kwa, -1),
+        inputs=[results_state, page_state, kw_all_state],
         outputs=[result_html, page_state]
     )
     next_btn.click(
-        lambda res, p: turn_page(res, p, 1),
-        inputs=[results_state, page_state],
+        lambda res, p, kwa: turn_page(res, p, kwa, 1),
+        inputs=[results_state, page_state, kw_all_state],
         outputs=[result_html, page_state]
-    )
-    csv_btn.click(
-        fn=export_csv,
-        inputs=[results_state],
-        outputs=[csv_output]
     )
 
 if __name__ == "__main__":
