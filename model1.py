@@ -1,3 +1,7 @@
+# broadening_search_app.py
+# Spectral line broadening literature search (Crossref + heuristic + batch LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+
 import os
 import certifi
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -8,7 +12,6 @@ import csv
 import io
 import re
 import json
-import time
 import string
 from typing import List, Dict, Tuple
 
@@ -20,7 +23,7 @@ if not OPENROUTER_API_KEY:
 LLM_MODEL = "deepseek/deepseek-chat-v3-0324:free"
 PAGE_SIZE = 20
 
-# ── 物理期刊白名单（精确名/前缀）──
+# —— 物理期刊白名单（精确名/前缀）——
 PHYSICS_JOURNALS = [
     "Physical Review", "Physical Review Letters",
     "Physical Review A", "Physical Review B", "Physical Review C", "Physical Review D",
@@ -40,22 +43,27 @@ PHYSICS_JOURNALS = [
     "Spectrochimica Acta Part A: Molecular and Biomolecular Spectroscopy"
 ]
 
-# 搜索/启发式关键词
-PARAM_KEYWORDS = [
-    "pressure broadening", "line broadening", "linewidth", "halfwidth", "half-width",
-    "voigt", "gamma", "line shift", "pressure shift", "temperature exponent", "n",
-    "line shape", "lineshape", "collisional", "collision-induced"
+# —— 启发式关键词（含老论文表述）——
+PARAM_HEURISTICS = [
+    # 常用
+    "pressure broadening", "pressure-broadened", "collisional broadening",
+    "line broadening", "linewidth", "halfwidth", "half-width",
+    "voigt", "line shape", "lineshape", "broadening coefficient",
+    "gamma", "pressure shift", "line shift", "temperature exponent",
+    # 老论文/常见缩写
+    "lorentz", "lorentzian", "hwhm", "fwhm",
+    "air-broadened", "self-broadened", "n2-broadened", "o2-broadened",
+    "line-mixing", "foreign broadening"
 ]
 
-PARAM_HEURISTICS = [
-    "pressure broadening", "pressure-broadened", "line broadening",
-    "linewidth", "halfwidth", "half-width", "voigt", "line shape", "lineshape",
-    "gamma", "broadening coefficient", "temperature exponent", "line shift", "pressure shift",
-    "collisional", "collision-induced", "spectral width"
+# 默认检索词（UI 可覆盖）
+DEFAULT_QUERY_TERMS = [
+    "pressure broadening", "line broadening", "linewidth", "half-width", "halfwidth",
+    "Voigt", "broadening coefficient", "gamma", "pressure shift", "temperature exponent", "line shape"
 ]
 
 # ─────────────────────────────
-# 工具函数
+# 规范化/工具函数
 # ─────────────────────────────
 
 def _norm_journal(name: str) -> str:
@@ -87,7 +95,6 @@ def get_key(entry: Dict) -> str:
     doi = (entry.get('DOI', '') or '').strip().lower()
     if doi:
         return "doi:" + doi
-    # 标题归一化 + 第一作者
     title = (entry.get('Title','') or '').lower()
     title = title.translate(str.maketrans('', '', string.punctuation))
     title = re.sub(r"\s+", " ", title).strip()
@@ -119,17 +126,19 @@ def highlight_keywords(text: str, keywords: List[str]) -> str:
     return text
 
 # ─────────────────────────────
-# Crossref 搜索（更稳的 query + filter）
+# Crossref 多策略检索（并集 + 去重 + 软性反噪）
 # ─────────────────────────────
 
-def search_crossref_multi(keywords, species, perturbers, max_results=500, min_year=2000, max_year=2025, physics_journals_only=False):
+def search_crossref_multi(keywords, species, perturbers,
+                          max_results=500, min_year=2000, max_year=2025,
+                          physics_journals_only=False, order="desc") -> List[Dict]:
     """
     Multi-strategy query:
-    - 多组同义词与不同 query 字段轮询（query / query.title / query.bibliographic）
-    - 合并去重；可选期刊白名单；轻度“反 CIA”过滤
+    - 多组同义词 & 多个 query 字段（query / query.title / query.bibliographic）
+    - 并集去重；可选期刊白名单；软性过滤掉 CIA-only / 高能物理等噪声
     """
     def _call(params):
-        headers = {"User-Agent": "broadening-search/1.1 (mailto:your_email@ucl.ac.uk)"}
+        headers = {"User-Agent": "broadening-search/1.3 (mailto:your_email@ucl.ac.uk)"}
         try:
             r = requests.get("https://api.crossref.org/works", params=params, headers=headers, timeout=60)
             r.raise_for_status()
@@ -137,17 +146,14 @@ def search_crossref_multi(keywords, species, perturbers, max_results=500, min_ye
         except Exception:
             return []
 
-    # —— 构造检索词 —— #
+    # 用户词/默认词
     user_terms = [t.strip() for t in (keywords or []) if t.strip()]
-    base_terms = user_terms or [
-        "pressure broadening", "line broadening", "linewidth", "half-width", "halfwidth",
-        "Voigt", "broadening coefficient", "gamma", "pressure shift", "temperature exponent", "line shape"
-    ]
+    base_terms = user_terms or DEFAULT_QUERY_TERMS
+
     sp = " ".join(species or [])
     pe = " ".join(perturbers or [])
     specie_block = " ".join([sp, pe]).strip()
 
-    # 关键同义词组（多轮检索的核心）
     broaden_sets = [
         "pressure broadening",
         "collisional broadening",
@@ -156,30 +162,27 @@ def search_crossref_multi(keywords, species, perturbers, max_results=500, min_ye
         "Voigt lineshape line shape",
         "broadening coefficient gamma",
         "pressure shift line shift",
-        "temperature exponent n"
+        "temperature exponent n",
+        # 老论文里的描述
+        "Lorentz Lorentzian HWHM FWHM"
     ]
 
-    # 生成多条 query（把种类、碰撞体拼进去以提高主题相关性）
     query_strings = []
     if base_terms:
         query_strings.append(" ".join(base_terms + ([specie_block] if specie_block else [])))
     for s in broaden_sets:
         qs = " ".join([s, specie_block]).strip() if specie_block else s
         query_strings.append(qs)
-    # 去重
     query_strings = list(dict.fromkeys([q for q in query_strings if q]))
 
-    # 三种字段策略
     strategies = [
         ("query", None),
         ("query.title", None),
         ("query.bibliographic", None),
     ]
 
-    # 公共过滤项
     base_filter = f"from-pub-date:{min_year}-01-01,until-pub-date:{max_year}-12-31,type:journal-article"
 
-    # —— 累积召回 —— #
     pool = []
     for q in query_strings:
         for field, _ in strategies:
@@ -189,7 +192,7 @@ def search_crossref_multi(keywords, species, perturbers, max_results=500, min_ye
                 "rows": max_results,
                 "select": "title,author,issued,container-title,DOI,abstract",
                 "sort": "issued",
-                "order": "desc"
+                "order": order
             }
             items = _call(params)
             for item in items:
@@ -206,61 +209,67 @@ def search_crossref_multi(keywords, species, perturbers, max_results=500, min_ye
                     "Title": title, "Authors": authors, "Year": year, "Journal": journal, "DOI": doi, "Abstract": abstract
                 })
 
-    # 去重
     pool = deduplicate_papers(pool)
 
-    # （可选）物理期刊白名单
     if physics_journals_only:
         pool = [r for r in pool if is_physics_journal(r.get("Journal"))]
 
-    # 软性“反 CIA”过滤：如果标题+摘要包含 “collision-induced absorption / CIA”
-    # 且不包含 broaden/linewidth/Voigt/half-width 等，则丢弃
-    soft_neg = ["collision-induced absorption", "CIA "]
-    must_pos = ["broadening", "linewidth", "half-width", "halfwidth", "voigt", "broadening coefficient", "gamma", "line shift"]
+    # 软性负样过滤：CIA-only & 高能/粒子/等离子等；若出现真正展宽关键词则放行
+    soft_neg = [
+        "collision-induced absorption", " cia ",
+        "gamma ray", "neutrino", "proton", "hadron", "quark", "collider",
+        "heavy-ion", "brownian", "quantum chromodynamics", "phase transition in lattice",
+        "optical clock", "frequency comb", "microresonator", "laser cavity linewidth"
+    ]
+    must_pos = [
+        "broadening", "linewidth", "half-width", "halfwidth",
+        "voigt", "broadening coefficient", "gamma", "line shift",
+        "lorentz", "lorentzian", "hwhm", "fwhm"
+    ]
+
     cleaned = []
     for r in pool:
         s = (r.get("Title","") + " " + r.get("Abstract","")).lower()
-        if any(neg.lower() in s for neg in soft_neg):
-            if not any(pos in s for pos in must_pos):
-                continue
+        if any(neg in s for neg in soft_neg) and not any(pos in s for pos in must_pos):
+            continue
         cleaned.append(r)
 
     return cleaned
 
 # ─────────────────────────────
-# 启发式粗筛 + 批量 LLM 过滤
+# 启发式排序 + 批量 LLM 过滤（Recall-first）
 # ─────────────────────────────
 
-def coarse_filter(entries: List[Dict], top_k: int = 120) -> Tuple[List[Dict], int]:
+def coarse_filter(entries: List[Dict], top_k: int | None = None) -> Tuple[List[Dict], int]:
+    """
+    只排序不裁剪；top_k=None 表示保留全部。
+    你也可以传入一个上限（比如 300）来做轻度裁剪。
+    """
     scored = []
     for e in entries:
         s = (e.get("Title","") + " " + (e.get("Abstract","") or "")).lower()
         hits = sum(1 for w in PARAM_HEURISTICS if w in s)
-        if e.get("Abstract"):  # 有摘要加分
+        if e.get("Abstract"):
             hits += 0.5
         scored.append((hits, e))
     scored.sort(key=lambda x: x[0], reverse=True)
-    keep = [e for sc, e in scored if sc > 0][:top_k]
-    if not keep:
-        keep = [e for _, e in scored][:top_k]
+    if top_k is None:
+        top_k = len(scored)
+    keep = [e for _, e in scored][:min(top_k, len(scored))]
     return keep, len(keep)
 
 def llm_filter(entries: List[Dict],
                keywords: List[str],
                species: List[str],
                perturbers: List[str],
-               batch_size: int = 30) -> Tuple[List[Dict], Dict]:
-    """
-    批量判别（Recall-first）：不确定时也保留。
-    返回 (保留结果, 元信息)
-    """
+               batch_size: int = 30,
+               heur_cap: int | None = None) -> Tuple[List[Dict], Dict]:
     kept: List[Dict] = []
     meta = {"coarse": 0, "batches": 0}
-
     if not entries:
         return kept, meta
 
-    cand, coarse_n = coarse_filter(entries, top_k=min(150, len(entries)))
+    cand, coarse_n = coarse_filter(entries, top_k=heur_cap)  # None=不过滤
     meta["coarse"] = coarse_n
 
     def build_payload(chunk: List[Dict]) -> List[Dict]:
@@ -275,10 +284,15 @@ def llm_filter(entries: List[Dict],
 
     def call_llm(records: List[Dict]) -> List[Dict]:
         sys_prompt = (
-            "You are an expert in molecular spectroscopy. For each paper, decide if it likely contains "
-            "experimental line-shape/broadening parameters (gamma, temperature exponent n, linewidth, Voigt fits, "
-            "pressure shift, etc.). Be inclusive if uncertain. "
-            "Return a JSON array with objects: {i:<index>, relevant: true/false, reason:<short>}."
+            "You are an expert in molecular/atomic spectroscopy (gas-phase). "
+            "For each paper, decide if it likely reports EXPERIMENTAL line-shape or pressure-broadening "
+            "parameters for molecular/atomic transitions (e.g., Lorentz/Voigt width HWHM/FWHM, gamma, "
+            "temperature exponent n, pressure/line shift) typically in IR/visible/microwave spectra. "
+            "EXCLUDE particle/nuclear/high-energy physics (gamma rays, neutrinos, proton collisions, colliders), "
+            "solid-state or laser-cavity linewidths without gas-phase collisions, generic optics (optical clocks), "
+            "and unrelated Brownian/transport statistics. "
+            "Be inclusive only if it plausibly contains measured broadening parameters. "
+            "Return a JSON array with objects: {i:<index>, relevant:true/false, reason:<short>}."
         )
         user_prompt = "PAPERS:\n" + "\n".join(
             [f"[{r['i']}] Title: {r['title']}\nAbstract: {r['abstract']}\nJournal: {r['journal']}" for r in records]
@@ -296,9 +310,9 @@ def llm_filter(entries: List[Dict],
                         {"role": "system", "content": sys_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
-                    "max_tokens": 600,
+                    "max_tokens": 700,
                     "temperature": 0.0,
-                    "response_format": {"type": "json_object"}  # 部分模型支持；不支持会忽略
+                    "response_format": {"type": "json_object"}
                 },
                 timeout=60
             )
@@ -306,7 +320,6 @@ def llm_filter(entries: List[Dict],
             try:
                 data = json.loads(content)
             except Exception:
-                # 若返回不是纯 JSON，尝试提取数组
                 m = re.search(r"\[.*\]", content, re.S)
                 data = json.loads(m.group(0)) if m else []
 
@@ -321,13 +334,11 @@ def llm_filter(entries: List[Dict],
             # 出错保守：全部纳入
             return [{"i": r["i"], "relevant": True, "reason": f"fallback: {e}"} for r in records]
 
-    # 分批
     for start in range(0, len(cand), batch_size):
         chunk = cand[start:start+batch_size]
         payload = build_payload(chunk)
         meta["batches"] += 1
         results = call_llm(payload) or []
-        # 回填
         for r in results:
             try:
                 i = int(r.get("i", -1))
@@ -338,7 +349,6 @@ def llm_filter(entries: List[Dict],
                 if r.get("relevant", True):
                     original["LLM"] = f"Relevant: {r.get('reason','')}"
                     kept.append(original)
-        # 若模型未返回（极端情况），把本批都保留
         if not results:
             for original in chunk:
                 original["LLM"] = "Relevant: fallback empty"
@@ -397,8 +407,8 @@ def format_results_html(results: List[Dict], page: int = 1, keywords: List[str] 
 
         html += '</tr>'
 
-    html += '</tbody></table>'
     pages = max(1, (total - 1) // PAGE_SIZE + 1)
+    html += '</tbody></table>'
     html += f'<div style="padding:6px;text-align:right;color:#666">Total <b>{total}</b> entries, page <b>{page}</b> / <b>{pages}</b></div>'
     html += f'<div style="padding:6px;background:#e6f7ff;border-radius:4px;margin-top:8px">Blue background: Physics journal</div>'
     html += '</div>'
@@ -426,13 +436,25 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     </div>
     """)
 
-    keywords_input = gr.Textbox(label="Search keywords (comma separated)", value="pressure broadening, linewidth, halfwidth, Voigt, gamma, shift", placeholder="pressure broadening, gamma, shift, ...")
+    keywords_input = gr.Textbox(
+        label="Search keywords (comma separated)",
+        value="pressure broadening, linewidth, halfwidth, Voigt, gamma, shift, Lorentz, HWHM, FWHM",
+        placeholder="pressure broadening, gamma, shift, ..."
+    )
     species_input = gr.Textbox(label="Active Species (comma separated)", value="", placeholder="CO2, NO, H2O ...")
-    perturber_input = gr.Textbox(label="Perturbers (comma separated)", value="", placeholder="N2, O2, He ...")
+    perturber_input = gr.Textbox(label="Perturbers (comma separated)", value="", placeholder="N2, O2, He, H2, air ...")
     max_results_input = gr.Number(label="Max results", value=500, precision=0)
     min_year_input = gr.Number(label="Earliest year", value=2000, precision=0)
     max_year_input = gr.Number(label="Latest year", value=2025, precision=0)
     journal_filter_checkbox = gr.Checkbox(label="Only physics journals", value=True)
+
+    # 新增：启发式上限（0=不过滤）与按年排序
+    heur_cap_input = gr.Number(label="Heuristic cap (0 = keep all)", value=0, precision=0)
+    order_dropdown = gr.Dropdown(
+        label="Sort by year",
+        choices=["DESC (newest first)", "ASC (oldest first)"],
+        value="DESC (newest first)"
+    )
 
     with gr.Row():
         search_btn = gr.Button("Search", scale=1)
@@ -447,27 +469,37 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     kw_all_state = gr.State([])
     log_output = gr.Textbox(label="Log", value="", lines=8)
 
-    def do_search(kw, sp, pe, mx, miny, maxy, journal_filter):
+    def do_search(kw, sp, pe, mx, miny, maxy, journal_filter, heur_cap, order_choice):
         log_msgs = []
         mx = int(mx) if mx else 500
         miny = int(miny) if miny else 2000
         maxy = int(maxy) if maxy else 2025
+        cap = int(heur_cap) if heur_cap else 0  # 0=不过滤
+        order = "desc" if "DESC" in (order_choice or "").upper() else "asc"
 
         keywords = [k.strip() for k in (kw or "").split(",") if k.strip()]
         species = [s.strip() for s in (sp or "").split(",") if s.strip()]
         perturber = [p.strip() for p in (pe or "").split(",") if p.strip()]
+        if not perturber:
+            perturber = ["N2", "O2", "He", "H2", "air"]
 
         log_msgs.append("Starting CrossRef search (expanded multi-strategy)...")
         all_results = search_crossref_multi(
             keywords, species, perturber,
             max_results=mx, min_year=miny, max_year=maxy,
-            physics_journals_only=journal_filter
+            physics_journals_only=journal_filter, order=order
         )
         log_msgs.append(f"Fetched (after merge/dedup/soft-neg): {len(all_results)} records")
 
         log_msgs.append("Applying heuristic + batch LLM filter ...")
-        filtered, meta = llm_filter(all_results, keywords, species, perturber)
+        filtered, meta = llm_filter(all_results, keywords, species, perturber, heur_cap=(None if cap==0 else cap))
         log_msgs.append(f"After heuristic: {meta.get('coarse', 0)} candidates; LLM kept: {len(filtered)} (batches={meta.get('batches',0)})")
+
+        # 再按年份做稳定排序（以免多路合并后顺序乱）
+        if order == "asc":
+            filtered = sorted(filtered, key=lambda r: (r.get("Year") is None, r.get("Year")))
+        else:
+            filtered = sorted(filtered, key=lambda r: (r.get("Year") is None, -int(r.get("Year") or 0)))
 
         kw_all = keywords + species + perturber
         html = format_results_html(filtered, 1, kw_all)
@@ -490,10 +522,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     search_btn.click(
         fn=do_search,
-        inputs=[keywords_input, species_input, perturber_input, max_results_input, min_year_input, max_year_input, journal_filter_checkbox],
+        inputs=[
+            keywords_input, species_input, perturber_input,
+            max_results_input, min_year_input, max_year_input,
+            journal_filter_checkbox, heur_cap_input, order_dropdown
+        ],
         outputs=[result_html, results_state, page_state, kw_all_state, log_output]
     )
-
     prev_btn.click(
         lambda res, p, kwa: turn_page(res, p, kwa, -1),
         inputs=[results_state, page_state, kw_all_state],
