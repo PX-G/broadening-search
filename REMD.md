@@ -216,6 +216,6 @@ This strengthens the “Quality of programming” section in the marking rubric.
 
 Maintainers
 
-Default contact: your name / email
+Default contact: Pengxia Guo / ucappg1@ucl.ac.uk
 
 User agent string is set to broadening-search/<version> for polite API usage.
