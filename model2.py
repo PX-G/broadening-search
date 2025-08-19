@@ -2,10 +2,10 @@
 Spectral Line Broadening Literature Search
 ------------------------------------------
 Crossref multi-strategy retrieval + spectroscopy-aware heuristics + batch LLM triage,
-with stable sorting (Journal priority → Year → Title) and optional species/perturber
-hard filter. Built for robustness (single Session with retry/backoff) and readability.
+with stable sorting (Journal priority → Year → Title), optional species/perturber
+hard filter, and CSV/BibTeX export.
 
-How to run:
+Run:
   1) pip install gradio requests certifi
   2) export/set OPENROUTER_API_KEY="sk-or-xxxx"
   3) python model1.py
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import csv
 import json
 import string
 from typing import List, Dict, Tuple, Any, Optional
@@ -31,7 +32,7 @@ os.environ["SSL_CERT_FILE"] = certifi.where()
 # Configuration
 # =============================================================================
 
-VERSION = "1.7"
+VERSION = "1.8"
 PAGE_SIZE = 20
 DEFAULT_MAX_RESULTS = 500
 DEFAULT_YEAR_MIN = 2000
@@ -463,6 +464,98 @@ def llm_filter(
     return kept, meta
 
 # =============================================================================
+# Export helpers (CSV / BibTeX)
+# =============================================================================
+
+def export_results_csv(results: List[Dict[str, Any]], path: str = "broadening_results.csv") -> str:
+    """Write minimal CSV (Title, Authors, Year, Journal, DOI). Return file path."""
+    fields = ["Title", "Authors", "Year", "Journal", "DOI"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in results:
+            row = {k: r.get(k, "") for k in fields}
+            writer.writerow(row)
+    return path
+
+def _bibtex_escape(s: str) -> str:
+    """Lightweight escaping for common BibTeX special chars."""
+    if not s:
+        return ""
+    repl = {
+        "\\": "\\textbackslash{}",
+        "{": "\\{",
+        "}": "\\}",
+        "&": "\\&",
+        "%": "\\%",
+        "$": "\\$",
+        "#": "\\#",
+        "_": "\\_",
+        "~": "\\textasciitilde{}",
+        "^": "\\textasciicircum{}",
+    }
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    return s
+
+def _authors_to_bibtex(auth_str: str) -> str:
+    """
+    Convert "Given Family, Given2 Family2" → "Family, Given and Family2, Given2".
+    This is heuristic but works for Crossref's 'given' + 'family' flattening we do.
+    """
+    if not auth_str:
+        return ""
+    parts = [a.strip() for a in auth_str.split(",") if a.strip()]
+    norm = []
+    for p in parts:
+        toks = p.split()
+        if len(toks) == 1:
+            norm.append(toks[0])
+        else:
+            family = toks[-1]
+            given = " ".join(toks[:-1])
+            norm.append(f"{family}, {given}")
+    return " and ".join(norm)
+
+def _citekey_from_entry(r: Dict[str, Any]) -> str:
+    """Build a simple citekey: <firstAuthorFamily><year><firstWordOfTitle>."""
+    title = (r.get("Title") or "").strip()
+    authors = (r.get("Authors") or "").strip()
+    year = str(r.get("Year") or "").strip()
+    first_word = re.sub(r"[^A-Za-z0-9]+", "", title.split()[0]) if title else "paper"
+    first_author = "anon"
+    if authors:
+        first = authors.split(",")[0].strip()
+        toks = first.split()
+        first_author = (toks[-1] if toks else first).lower()
+    ck = f"{first_author}{year}{first_word}"
+    return re.sub(r"[^A-Za-z0-9]+", "", ck)
+
+def export_results_bibtex(results: List[Dict[str, Any]], path: str = "broadening_results.bib") -> str:
+    """Write a minimal @article BibTeX file. Return file path."""
+    lines: List[str] = []
+    for r in results:
+        key = _citekey_from_entry(r)
+        title = _bibtex_escape(r.get("Title") or "")
+        journal = _bibtex_escape(r.get("Journal") or "")
+        year = r.get("Year")
+        doi = (r.get("DOI") or "").strip()
+        authors_bib = _bibtex_escape(_authors_to_bibtex(r.get("Authors") or ""))
+
+        lines.append(f"@article{{{key},")
+        if title:   lines.append(f"  title   = {{{title}}},")
+        if authors_bib: lines.append(f"  author  = {{{authors_bib}}},")
+        if journal: lines.append(f"  journal = {{{journal}}},")
+        if year:    lines.append(f"  year    = {{{year}}},")
+        if doi:
+            lines.append(f"  doi     = {{{doi}}},")
+            lines.append(f"  url     = {{https://doi.org/{doi}}},")
+        lines.append("}\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+# =============================================================================
 # Rendering
 # =============================================================================
 
@@ -566,11 +659,18 @@ def create_demo() -> gr.Blocks:
             prev_btn = gr.Button("Previous page", scale=1)
             next_btn = gr.Button("Next page", scale=1)
 
+        # New: export buttons
+        with gr.Row():
+            csv_btn = gr.Button("Export CSV", scale=1)
+            bib_btn = gr.Button("Export BibTeX", scale=1)
+
         result_html = gr.HTML()
         results_state = gr.State([])
         page_state = gr.State(1)
         kw_all_state = gr.State([])
         log_output = gr.Textbox(label="Log", value="", lines=8)
+        csv_file = gr.File(label="", visible=False)
+        bib_file = gr.File(label="", visible=False)
 
         def do_search(kw, sp, pe, mx, miny, maxy, journal_filter, require_species, heur_cap, order_choice, prioritize):
             log_msgs: List[str] = []
@@ -622,6 +722,12 @@ def create_demo() -> gr.Blocks:
             html = format_results_html(results, page, kw_all)
             return html, page
 
+        def do_export_csv(results: List[Dict[str, Any]]):
+            return export_results_csv(results)
+
+        def do_export_bib(results: List[Dict[str, Any]]):
+            return export_results_bibtex(results)
+
         search_btn.click(
             fn=do_search,
             inputs=[
@@ -642,6 +748,8 @@ def create_demo() -> gr.Blocks:
             inputs=[results_state, page_state, kw_all_state],
             outputs=[result_html, page_state]
         )
+        csv_btn.click(fn=do_export_csv, inputs=[results_state], outputs=[csv_file])
+        bib_btn.click(fn=do_export_bib, inputs=[results_state], outputs=[bib_file])
 
     return demo
 
