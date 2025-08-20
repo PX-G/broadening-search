@@ -104,13 +104,14 @@ JOURNAL_PRIORITY = [
 # Soft-negative and must-positive terms for denoising
 SOFT_NEG = [
     "collision-induced absorption", " cia ",
-    "gamma ray", "neutrino", "proton", "hadron", "quark", "collider",
+    "gamma ray", "gamma-ray", "neutrino", "proton", "hadron", "quark", "collider",
     "heavy-ion", "brownian", "quantum chromodynamics", "phase transition in lattice",
     "optical clock", "frequency comb", "microresonator", "laser cavity linewidth",
 ]
+
 MUST_POS = [
     "broadening", "linewidth", "half-width", "halfwidth",
-    "voigt", "broadening coefficient", "gamma", "line shift",
+    "voigt", "broadening coefficient", "line shift",
     "lorentz", "lorentzian", "hwhm", "fwhm",
 ]
 
@@ -119,7 +120,12 @@ MUST_POS = [
 # =============================================================================
 
 def build_session() -> requests.Session:
-    """Create a Session with retry/backoff and a descriptive User-Agent."""
+    """
+    Create and return a configured `requests.Session` with retry/backoff and a descriptive User-Agent.
+
+    Returns:
+        requests.Session: Session mounted for http/https with Retry on common transient errors.
+    """
     s = requests.Session()
     retries = Retry(
         total=RETRY_TOTAL,
@@ -140,7 +146,7 @@ SESSION = build_session()
 # =============================================================================
 
 def _norm_journal(name: str) -> str:
-    """Normalize journal names for matching."""
+    """Normalize a journal name for robust matching (lowercase, replace &, strip non-alnum)."""
     if not name:
         return ""
     s = name.lower().replace("&", "and")
@@ -152,23 +158,57 @@ _PHYSICS_PREFIXES = {_norm_journal("Physical Review")}
 _PRIORITY_MAP = {_norm_journal(j): i for i, j in enumerate(JOURNAL_PRIORITY)}
 
 def is_physics_journal(journal_name: str) -> bool:
-    """True if the journal is a physics journal (exact or prefix match)."""
+    """
+    Check whether a journal belongs to the physics/spectroscopy set.
+
+    Args:
+        journal_name: Raw journal name.
+
+    Returns:
+        bool: True if the name matches a known physics journal or the "Physical Review" prefix.
+    """
     n = _norm_journal(journal_name)
     return bool(n) and ((n in _PHYSICS_SET) or any(n.startswith(p) for p in _PHYSICS_PREFIXES))
 
 def priority_score(journal_name: str) -> int:
-    """Return 0/1/2 for JQSRT/JMS/JCP, else 999 (lower is better)."""
+    """
+    Get the journal priority rank.
+
+    Args:
+        journal_name: Raw journal name.
+
+    Returns:
+        int: 0/1/2 for JQSRT/JMS/JCP; 999 for all others (lower is better).
+    """
     return _PRIORITY_MAP.get(_norm_journal(journal_name), 999)
 
 def strip_tags(s: Optional[str]) -> str:
-    """Remove XML/HTML tags and condense whitespace."""
+    """
+    Remove XML/HTML tags and condense whitespace from a string.
+
+    Args:
+        s: Source text (may be None).
+
+    Returns:
+        str: Cleaned plain text.
+    """
     if not s:
         return ""
     s = re.sub(r"<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 def get_key(entry: Dict[str, Any]) -> str:
-    """Dedup key: DOI if present; else title(no punct)+first author."""
+    """
+    Build a deterministic deduplication key for a paper.
+
+    Prefers DOI; falls back to normalized title + first author (lowercased).
+
+    Args:
+        entry: Dict with keys Title/Authors/DOI.
+
+    Returns:
+        str: Stable dedup key.
+    """
     doi = (entry.get("DOI") or "").strip().lower()
     if doi:
         return f"doi:{doi}"
@@ -179,7 +219,15 @@ def get_key(entry: Dict[str, Any]) -> str:
     return f"title:{title}|fa:{first_author}"
 
 def deduplicate_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Stable deduplication preserving first occurrence."""
+    """
+    Remove duplicate entries while preserving the first occurrence.
+
+    Args:
+        papers: List of paper dicts.
+
+    Returns:
+        List[Dict[str, Any]]: Unique list in original order.
+    """
     seen: set[str] = set()
     unique: List[Dict[str, Any]] = []
     for p in papers:
@@ -190,7 +238,16 @@ def deduplicate_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return unique
 
 def highlight_keywords(text: str, keywords: List[str]) -> str:
-    """Highlight keywords with <mark> tags in a safe/insensitive way."""
+    """
+    Mark matched keywords in text using <mark> for lightweight highlighting.
+
+    Args:
+        text: Source text to render.
+        keywords: Case-insensitive list of tokens to highlight.
+
+    Returns:
+        str: HTML string with <mark> spans.
+    """
     if not text:
         return ""
     uniq = sorted({kw.strip() for kw in keywords if kw.strip()}, key=len, reverse=True)
@@ -209,20 +266,27 @@ def highlight_keywords(text: str, keywords: List[str]) -> str:
 # =============================================================================
 
 def _safe_year(y: Any) -> Optional[int]:
+    """Best-effort cast to int year; returns None on failure."""
     try:
         return int(y)
     except Exception:
         return None
 
 def _norm_title(t: Optional[str]) -> str:
+    """Normalize title for tie-breaking (lowercased, single spaces)."""
     return re.sub(r"\s+", " ", (t or "").strip().lower())
 
 def sort_results_stable(results: List[Dict[str, Any]], year_order: str = "desc", prioritize: bool = True) -> List[Dict[str, Any]]:
     """
-    Stable sort key: (priority, year_key, title)
-      - priority: 0/1/2 for JQSRT/JMS/JCP if prioritize, else 999
-      - year_key: None always last; descending or ascending
-      - title: normalized as final tie-breaker for consistent pagination
+    Sort results by a stable composite key: (journal priority → year → normalized title).
+
+    Args:
+        results: List of paper dicts (Title/Journal/Year).
+        year_order: "desc" (newest first) or "asc" (oldest first).
+        prioritize: If True, apply JQSRT/JMS/JCP priority (0/1/2; others 999).
+
+    Returns:
+        List[Dict[str, Any]]: New sorted list (stable for consistent pagination).
     """
     desc = year_order.lower().startswith("d")
 
@@ -239,6 +303,7 @@ def sort_results_stable(results: List[Dict[str, Any]], year_order: str = "desc",
 # =============================================================================
 
 def _crossref_call(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Low-level Crossref call with raise_for_status and message/items extraction."""
     try:
         r = SESSION.get("https://api.crossref.org/works", params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
@@ -259,8 +324,20 @@ def search_crossref_multi(
     order: str = "desc",
 ) -> List[Dict[str, Any]]:
     """
-    Build multiple query strings across Crossref fields and union the results.
-    Soft-denoise removes obvious non-broadening uses (e.g., gamma rays, optical clocks).
+    Retrieve papers from Crossref by combining multiple query strategies, then deduplicate and softly denoise.
+
+    Args:
+        keywords: Free-text terms; if empty, sensible defaults are used.
+        species: Active species list (e.g., CO2, H2O).
+        perturbers: Perturber list (e.g., N2, O2, He).
+        max_results: Max rows per Crossref request (per strategy/field).
+        min_year: Inclusive lower bound for publication year.
+        max_year: Inclusive upper bound for publication year.
+        physics_journals_only: If True, keep only physics/spectroscopy venues.
+        order: "desc" or "asc" by issued date.
+
+    Returns:
+        List[Dict[str, Any]]: Cleaned candidate pool.
     """
     # Validate years
     if min_year > max_year:
@@ -350,7 +427,16 @@ def search_crossref_multi(
 # =============================================================================
 
 def coarse_filter(entries: List[Dict[str, Any]], top_k: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
-    """Score by heuristic keyword presence; optionally keep top_k."""
+    """
+    Compute a simple heuristic score per entry and keep the top-K if specified.
+
+    Args:
+        entries: Candidate records.
+        top_k: If None, keep all; else keep top-K by heuristic score.
+
+    Returns:
+        (kept_list, kept_count): Sorted (desc) by score, truncated to K if provided.
+    """
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for e in entries:
         s = (e.get("Title", "") + " " + (e.get("Abstract") or "")).lower()
@@ -364,7 +450,7 @@ def coarse_filter(entries: List[Dict[str, Any]], top_k: Optional[int] = None) ->
     return keep, len(keep)
 
 def _build_llm_payload(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Prepare a compact payload for model consumption."""
+    """Compact each entry into a small dict suitable for batching into the LLM API."""
     records: List[Dict[str, Any]] = []
     for idx, e in enumerate(chunk):
         t = (e.get("Title") or "")[:MAX_TITLE_CHARS]
@@ -374,7 +460,13 @@ def _build_llm_payload(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return records
 
 def _call_llm(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Call OpenRouter; parse JSON safely; on failure mark all as relevant (recall-first)."""
+    """
+    Call the OpenRouter Chat Completions API and parse a JSON array of relevance decisions.
+
+    Returns:
+        List[Dict]: Each element like {'i': <index>, 'relevant': bool, 'reason': str}.
+        On failure, defaults to marking all as relevant to favor recall.
+    """
     sys_prompt = (
         "You are an expert in molecular/atomic spectroscopy (gas-phase). "
         "For each paper, decide if it likely reports EXPERIMENTAL line-shape or pressure-broadening "
@@ -430,7 +522,20 @@ def llm_filter(
     batch_size: int = LLM_BATCH_SIZE,
     heur_cap: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Batch LLM screening with a coarse heuristic pre-rank."""
+    """
+    Apply a two-stage filter: heuristic pre-ranking (optional top-K) and batched LLM classification.
+
+    Args:
+        entries: Candidate pool from Crossref.
+        keywords: User-supplied query terms.
+        species: Active species tokens.
+        perturbers: Perturber tokens.
+        batch_size: Chunk size for each LLM API call.
+        heur_cap: If provided, only the top-K (by heuristic score) are sent to the LLM.
+
+    Returns:
+        (kept, meta): kept is the filtered list; meta includes 'coarse' kept count and 'batches' used.
+    """
     kept: List[Dict[str, Any]] = []
     meta: Dict[str, Any] = {"coarse": 0, "batches": 0}
     if not entries:
@@ -468,7 +573,16 @@ def llm_filter(
 # =============================================================================
 
 def export_results_csv(results: List[Dict[str, Any]], path: str = "broadening_results.csv") -> str:
-    """Write minimal CSV (Title, Authors, Year, Journal, DOI). Return file path."""
+    """
+    Export the current result set as a minimal CSV.
+
+    Args:
+        results: List of paper dicts.
+        path: Output file path.
+
+    Returns:
+        str: The path written to (for Gradio File return).
+    """
     fields = ["Title", "Authors", "Year", "Journal", "DOI"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -479,7 +593,7 @@ def export_results_csv(results: List[Dict[str, Any]], path: str = "broadening_re
     return path
 
 def _bibtex_escape(s: str) -> str:
-    """Lightweight escaping for common BibTeX special chars."""
+    """Lightweight escaping for BibTeX special characters."""
     if not s:
         return ""
     repl = {
@@ -500,8 +614,8 @@ def _bibtex_escape(s: str) -> str:
 
 def _authors_to_bibtex(auth_str: str) -> str:
     """
-    Convert "Given Family, Given2 Family2" → "Family, Given and Family2, Given2".
-    This is heuristic but works for Crossref's 'given' + 'family' flattening we do.
+    Convert a flat "Given Family, Given2 Family2" string to BibTeX "Family, Given and Family2, Given2".
+    Heuristic but adequate for flattened Crossref author strings.
     """
     if not auth_str:
         return ""
@@ -518,7 +632,7 @@ def _authors_to_bibtex(auth_str: str) -> str:
     return " and ".join(norm)
 
 def _citekey_from_entry(r: Dict[str, Any]) -> str:
-    """Build a simple citekey: <firstAuthorFamily><year><firstWordOfTitle>."""
+    """Build a simple citekey: <firstAuthorFamily><year><firstWordOfTitle> (alnum only)."""
     title = (r.get("Title") or "").strip()
     authors = (r.get("Authors") or "").strip()
     year = str(r.get("Year") or "").strip()
@@ -532,7 +646,16 @@ def _citekey_from_entry(r: Dict[str, Any]) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "", ck)
 
 def export_results_bibtex(results: List[Dict[str, Any]], path: str = "broadening_results.bib") -> str:
-    """Write a minimal @article BibTeX file. Return file path."""
+    """
+    Export the current result set as a minimal BibTeX file with @article entries.
+
+    Args:
+        results: List of paper dicts.
+        path: Output file path.
+
+    Returns:
+        str: The path written to (for Gradio File return).
+    """
     lines: List[str] = []
     for r in results:
         key = _citekey_from_entry(r)
@@ -560,7 +683,17 @@ def export_results_bibtex(results: List[Dict[str, Any]], path: str = "broadening
 # =============================================================================
 
 def format_results_html(results: List[Dict[str, Any]], page: int = 1, keywords: List[str] = []) -> str:
-    """Render current page as an HTML table with light highlighting and physics-journal tint."""
+    """
+    Render a paginated HTML table for the search results with keyword highlighting.
+
+    Args:
+        results: Full filtered result list.
+        page: 1-based page index.
+        keywords: Tokens to be highlighted in the Title column.
+
+    Returns:
+        str: HTML table markup (self-contained styles).
+    """
     total = len(results)
     start = (page - 1) * PAGE_SIZE
     end = min(start + PAGE_SIZE, total)
@@ -623,7 +756,12 @@ def format_results_html(results: List[Dict[str, Any]], page: int = 1, keywords: 
 # =============================================================================
 
 def create_demo() -> gr.Blocks:
-    """Build the Gradio interface."""
+    """
+    Build and return the Gradio Blocks application (UI + callbacks).
+
+    Returns:
+        gr.Blocks: A ready-to-launch Gradio app; call .launch() in __main__.
+    """
     with gr.Blocks(theme=gr.themes.Soft()) as demo:
         gr.Markdown(f"""
         # Spectral Line Broadening Literature Search ({LLM_MODEL})
