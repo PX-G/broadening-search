@@ -33,6 +33,24 @@ Built to quickly surface papers reporting **experimental pressure-broadening par
 
 ---
 
+## Project structure
+```
+broadening-search/
+  broadening-search/
+    __init__.py
+    model1.py
+    model2.py
+  tests/
+    conftest.py
+    test_utils.py
+    test_sort.py
+    test_export.py
+    test_crossref_search_mock.py
+
+
+```
+
+
 ## Install
 
 ### 1) Create & activate a virtual environment
@@ -179,15 +197,38 @@ MIT *(suggested). Update this section to match your project’s policy.*
 
 ---
 
-### Minimal tests (optional)
+### Testing
 
-Add `tests/` with a few fast checks for pure helpers:
+This project ships with a small offline test suite (no network calls) using `pytest`.
 
-- `priority_score()` → `0/1/2/999` as expected  
-- `is_physics_journal()` detects Physical Review and JQSRT/JMS/JCP  
-- `sort_results_stable()` preserves priority → year → title order
+#### Quick start
+```bash
+# 1) Activate your venv
+# Windows (PowerShell)
+. .\.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
 
----
+# 2) Install test dependency
+pip install pytest
+
+# 3) Set a dummy key so the module can be imported during tests
+# Windows (PowerShell)
+$env:OPENROUTER_API_KEY = "test"
+# macOS / Linux
+export OPENROUTER_API_KEY="test"
+
+# 4) Run tests
+python -m pytest -q
+```
+#### Model parity (model1.py vs model2.py)
+
+`model1.py` and `model2.py` are identical **except** for the `LLM_MODEL` setting:
+
+- `model1.py`: `deepseek/deepseek-chat-v3-0324:free`  
+- `model2.py`: `moonshotai/kimi-k2:free`
+
+All retrieval, denoising, sorting, exporting, and UI logic is shared. The unit tests target **model-agnostic** functionality (Crossref query building, soft negatives, deduplication, stable sorting, CSV/BibTeX export), so we only ship tests for `model1.py`; the results apply equally to `model2.py`. Switching models does not require any test changes. *(Note: End-to-end LLM triage may yield different paper sets, but this does not affect the tested invariants.)*
 
 **Maintainer:** *Pengxia Guo / ucappg1@ucl.ac.uk*  
 User-agent is `broadening-search/<version>` for polite API usage.
