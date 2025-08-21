@@ -50,8 +50,6 @@ broadening-search/
     broadening_results.csv
     broadening_results.bib
     sample output interface.jpeg
-=======
-
 
 ```
 
@@ -256,39 +254,6 @@ We provide the exact items exported from the app so reviewers can replicate resu
 > The **sample** files provided here were generated with `model1.py` (`deepseek/deepseek-chat-v3-0324:free`); minor differences may occur when re-running or when using `model2.py` due to model/version/serving variability and non-determinism.
 
 
-=======
-### Testing
-
-This project ships with a small offline test suite (no network calls) using `pytest`.
-
-#### Quick start
-```bash
-# 1) Activate your venv
-# Windows (PowerShell)
-. .\.venv\Scripts\Activate.ps1
-# macOS / Linux
-source .venv/bin/activate
-
-# 2) Install test dependency
-pip install pytest
-
-# 3) Set a dummy key so the module can be imported during tests
-# Windows (PowerShell)
-$env:OPENROUTER_API_KEY = "test"
-# macOS / Linux
-export OPENROUTER_API_KEY="test"
-
-# 4) Run tests
-python -m pytest -q
-```
-#### Model parity (model1.py vs model2.py)
-
-`model1.py` and `model2.py` are identical **except** for the `LLM_MODEL` setting:
-
-- `model1.py`: `deepseek/deepseek-chat-v3-0324:free`  
-- `model2.py`: `moonshotai/kimi-k2:free`
-
-All retrieval, denoising, sorting, exporting, and UI logic is shared. The unit tests target **model-agnostic** functionality (Crossref query building, soft negatives, deduplication, stable sorting, CSV/BibTeX export), so we only ship tests for `model1.py`; the results apply equally to `model2.py`. Switching models does not require any test changes. *(Note: End-to-end LLM triage may yield different paper sets, but this does not affect the tested invariants.)*
 
 
 **Maintainer:** *Pengxia Guo / ucappg1@ucl.ac.uk*  
