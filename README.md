@@ -33,6 +33,26 @@ Built to quickly surface papers reporting **experimental pressure-broadening par
 
 ---
 
+## Project structure
+```
+broadening-search/
+  broadening-search/
+    __init__.py
+    model1.py
+    model2.py
+  tests/
+    conftest.py
+    test_utils.py
+    test_sort.py
+    test_export.py
+    test_crossref_search_mock.py
+  sample ouput/
+    broadening_results.csv
+    broadening_results.bib
+    sample output interface.jpeg
+```
+
+
 ## Install
 
 ### 1) Create & activate a virtual environment
@@ -84,10 +104,10 @@ export OPENROUTER_API_KEY="sk-or-xxxxxxxx"
 Pick one of the two launch scripts(bash):
 ```bash
 # DeepSeek (free tier)
-python model1.py
+python broadening_search\\model1.py
 
 # Moonshot Kimi (free tier)
-python model2.py
+python broadening_search\\model2.py
 ```
 Gradio will print a local URL; open it in your browser.
 
@@ -171,23 +191,68 @@ Gradio will print a local URL; open it in your browser.
 - **Slow LLM** — use a smaller heuristic cap (e.g., `50`) or try the other model file.  
 - **Windows Git Bash** — prefer PowerShell to activate venv, or `source .venv/Scripts/activate`.
 
----
-
-### License
-
-MIT *(suggested). Update this section to match your project’s policy.*
 
 ---
 
-### Minimal tests (optional)
+## Testing
 
-Add `tests/` with a few fast checks for pure helpers:
+This project ships with a small offline test suite (no network calls) using `pytest`.
 
-- `priority_score()` → `0/1/2/999` as expected  
-- `is_physics_journal()` detects Physical Review and JQSRT/JMS/JCP  
-- `sort_results_stable()` preserves priority → year → title order
+### Quick start
+```bash
+# 1) Activate your venv
+# Windows (PowerShell)
+. .\.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
 
----
+# 2) Install test dependency
+pip install pytest
+
+# 3) Set a dummy key so the module can be imported during tests
+# Windows (PowerShell)
+$env:OPENROUTER_API_KEY = "test"
+# macOS / Linux
+export OPENROUTER_API_KEY="test"
+
+# 4) Run tests
+python -m pytest -q
+```
+### Model parity (model1.py vs model2.py)
+
+`model1.py` and `model2.py` are identical **except** for the `LLM_MODEL` setting:
+
+- `model1.py`: `deepseek/deepseek-chat-v3-0324:free`  
+- `model2.py`: `moonshotai/kimi-k2:free`
+
+All retrieval, denoising, sorting, exporting, and UI logic is shared. The unit tests target **model-agnostic** functionality (Crossref query building, soft negatives, deduplication, stable sorting, CSV/BibTeX export), so we only ship tests for `model1.py`; the results apply equally to `model2.py`. Switching models does not require any test changes. *(Note: End-to-end LLM triage may yield different paper sets, but this does not affect the tested invariants.)*
+
+## Offline dataset for reproducibility
+
+We provide the exact items exported from the app so reviewers can replicate results **without internet access**.
+
+- **CSV**: [`sample output/broadening_results.csv`](sample output/broadening_results.csv)  
+  Columns: `Title, Authors, Year, Journal, DOI`
+- **BibTeX**: [`sample output/broadening_results.bib`](sample output/broadening_results.bib)  
+  Minimal `@article` entries; citekey = `firstAuthorFamily + year + firstTitleWord`.
+
+**Provenance (UI settings):**
+
+- Keywords: `pressure broadening, linewidth, halfwidth, Voigt, gamma, shift, Lorentz, HWHM, FWHM`
+- Species: `H2O`
+- Perturbers: `N2, O2, He, H2, air`
+- Years: `2000–2025`
+- Physics-only: **ON**
+- Require species/perturber in title/abstract: **OFF**
+- Heuristic cap: `0` (keep all)
+- Sort by year: `DESC (newest first)`
+- Prioritize journals (JQSRT → JMS → JCP): **ON**
+
+> **Note:** `model1.py` and `model2.py` are identical apart from the LLM model ID.  
+> The dataset schema is the same for both; the exported CSV/BIB are model-agnostic.  
+> The **sample** files provided here were generated with `model1.py` (`deepseek/deepseek-chat-v3-0324:free`); minor differences may occur when re-running or when using `model2.py` due to model/version/serving variability and non-determinism.
+
+
 
 **Maintainer:** *Pengxia Guo / ucappg1@ucl.ac.uk*  
 User-agent is `broadening-search/<version>` for polite API usage.
