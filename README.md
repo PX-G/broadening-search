@@ -46,7 +46,6 @@ broadening-search/
     test_sort.py
     test_export.py
     test_crossref_search_mock.py
-<<<<<<< HEAD
   sample ouput/
     broadening_results.csv
     broadening_results.bib
@@ -54,7 +53,6 @@ broadening-search/
 =======
 
 
->>>>>>> 841f4839cb42ab7e111b4f749fa6881014dc7766
 ```
 
 
@@ -199,7 +197,6 @@ Gradio will print a local URL; open it in your browser.
 
 ---
 
-<<<<<<< HEAD
 ## Testing
 
 This project ships with a small offline test suite (no network calls) using `pytest`.
@@ -292,7 +289,7 @@ python -m pytest -q
 - `model2.py`: `moonshotai/kimi-k2:free`
 
 All retrieval, denoising, sorting, exporting, and UI logic is shared. The unit tests target **model-agnostic** functionality (Crossref query building, soft negatives, deduplication, stable sorting, CSV/BibTeX export), so we only ship tests for `model1.py`; the results apply equally to `model2.py`. Switching models does not require any test changes. *(Note: End-to-end LLM triage may yield different paper sets, but this does not affect the tested invariants.)*
->>>>>>> 841f4839cb42ab7e111b4f749fa6881014dc7766
+
 
 **Maintainer:** *Pengxia Guo / ucappg1@ucl.ac.uk*  
 User-agent is `broadening-search/<version>` for polite API usage.
